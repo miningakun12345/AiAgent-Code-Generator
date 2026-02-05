@@ -1,0 +1,30 @@
+{
+  "name": "ai-agent-poc",
+  "displayName": "AI Agent PoC",
+  "publisher": "your-publisher",
+  "version": "0.0.1",
+  "engines": { "vscode": "^1.70.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onCommand:aiAgent.openWebview"],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "aiAgent.openWebview",
+        "title": "AI Agent PoC: Open"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "tsc -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/vscode": "^1.70.0",
+    "vsce": "^2.10.0"
+  },
+  "dependencies": {}
+}
+

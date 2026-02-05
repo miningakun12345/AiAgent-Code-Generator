@@ -1,0 +1,11 @@
+{
+  "name": "ai-agent-sqlite",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "start": "node dist/main.js",
+    "dev": "ts-node-dev --respawn --transpile-only server/src/main.ts",
+    "build": "tsc -p server/tsconfig.json"
+  }
+}
+

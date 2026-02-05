@@ -1,0 +1,19 @@
+version: '3.8'
+services:
+  redis:
+    image: redis:7
+    ports: ['6379:6379']
+  server:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+      - ./sqlite_extensions:/app/sqlite_extensions
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DB_PATH=/app/data/data.db
+      - SQLITE_AI_EXT=/app/sqlite_extensions/libsqliteai.so
+    depends_on:
+      - redis
+

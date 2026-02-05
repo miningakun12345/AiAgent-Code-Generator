@@ -1,0 +1,12 @@
+{
+  "name": "AI Agent PoC Devcontainer",
+  "image": "mcr.microsoft.com/vscode/devcontainers/typescript-node:0-18",
+  "workspaceFolder": "/workspace",
+  "mounts": [
+    "source=${localWorkspaceFolder}/data,target=/workspace/data,type=bind",
+    "source=${localWorkspaceFolder}/sqlite_extensions,target=/workspace/sqlite_extensions,type=bind"
+  ],
+  "postCreateCommand": "cd server && npm install",
+  "remoteUser": "vscode"
+}
+
