@@ -1,0 +1,4366 @@
+Singkat: Anda bisa membangun AI‑agent coding platform yang mendukung banyak bahasa pemrograman menggunakan Node.js untuk backend dan SQLite sebagai penyimpanan lokal/edge, dengan SQLite‑AI (ekstensi AI untuk SQLite) untuk embedding dan inference on‑device, atau kombinasi SQLite + LLM cloud untuk tugas berat.
+
+docs.sqlitecloud.io
+
++1
+
+Ringkasan arsitektur dan pilihan utama
+Pendekatan	Kapan dipakai	Kelebihan	Kekurangan
+SQLite + SQLite‑AI (on‑device)	Aplikasi edge, privasi tinggi, latency rendah	AI di dalam DB; embedding & inference lokal; privat.	Model besar mungkin tidak muat; butuh integrasi C/extension. Github+1
+SQLite (metadata) + LLM cloud	Fitur kompleks (refactor, generate), resource terbatas	Simpel integrasi Node.js ke API LLM; skala mudah.	Bergantung koneksi & biaya API.
+SQLite + vector store eksternal	Pencarian kode besar / multi‑repo	Cepat retrieval; cocok multi‑bahasa.	Menambah komponen (Redis/FAISS).
+Komponen inti yang saya rekomendasikan
+Backend: Node.js + Express atau NestJS (modular, TypeScript).
+
+Database: SQLite untuk metadata, snippet, history; gunakan SQLite‑AI bila ingin inference lokal.
+
+Github
+
++1
+
+LLM: Integrasi ke API (OpenAI, Anthropic, Google) untuk tugas berat; fallback ke on‑device via sqlite‑ai/llama.cpp bila perlu.
+
+Indexing & retrieval: simpan embeddings di SQLite (via extension) atau sinkron ke vector DB untuk skala.
+
+docs.sqlitecloud.io
+
+Execution sandbox: jalankan kode user di container/sandbox terisolasi (Docker, Firecracker).
+
+Security: rate limit, input sanitization, resource quotas, audit logging.
+
+Alur fungsional (high level)
+Ingest: terima repo/snippet; ekstrak AST & metadata.
+
+Index: buat embeddings; simpan di SQLite (sqlite‑ai) atau sinkron ke vector DB.
+
+Github
+
+Query: user minta refactor/bugfix → retrieval + prompt assembly.
+
+Generate/Verify: panggil LLM atau on‑device model; jalankan test suite di sandbox.
+
+Commit: hasil disimpan sebagai patch; simpan history di SQLite.
+
+Implementasi awal & bukti konsep
+Langkah cepat: buat Node.js API yang menyimpan snippet ke SQLite; panggil LLM untuk explain/fix endpoint; simpan hasil dan tests.
+
+Jika ingin on‑device AI: integrasikan SQLite‑AI untuk membuat embedding dan menjalankan inference ringan langsung di DB.
+
+Github
+
++1
+
+Referensi implementasi nyata: contoh proyek AI‑powered code editor berbasis Node.js memberi pola integrasi LLM + file system.
+
+DEV Community
+
+Risiko, batasan, dan mitigasi
+Model size & performance: on‑device terbatas; gunakan hybrid (local small models + cloud LLM) untuk tugas berat.
+
+docs.sqlitecloud.io
+
+Keamanan eksekusi kode: selalu sandbox; batasi I/O dan CPU.
+
+Privasi & kepatuhan: simpan data sensitif terenkripsi; gunakan on‑device inference bila perlu.
+
+Biaya API: batasi panggilan, cache hasil, gunakan batching.
+
+Jika Anda setuju, saya bisa sediakan blueprint teknis (struktur repo, contoh endpoint Node.js + SQLite, contoh integrasi sqlite‑ai) berdasarkan skenario Anda: apakah fokus pada privasi (on‑device) atau kemampuan skala & akurasi (cloud LLM)?
+
+Copilot berkata
+Ringkasan singkat
+Anda memilih on‑device (SQLite‑AI). Di bawah ini saya berikan blueprint teknis lengkap: arsitektur, struktur repo, contoh kode (Node.js + TypeScript), cara mengintegrasikan SQLite + SQLite‑AI untuk embedding/inference, strategi sandbox eksekusi kode, dan langkah menjalankan proof‑of‑concept (PoC) di mesin lokal atau server di Mijen. Semua contoh siap Anda salin-tempel dan jalankan.
+
+1. Arsitektur tingkat tinggi
+Frontend: HTML/CSS/JS (editor kode: Monaco/CodeMirror).
+
+Backend: Node.js + TypeScript (Express atau NestJS).
+
+DB on‑device: SQLite dengan extension SQLite‑AI (menyimpan embeddings, menjalankan inference ringan via SQL UDF).
+
+Worker: job queue (BullMQ) untuk pembuatan embedding, indexing, dan verifikasi.
+
+Sandbox eksekusi: ephemeral Docker container per job (resource limits, network disabled).
+
+Model strategy: model kecil on‑device (via sqlite‑ai/llama.cpp) untuk generation/assist; tidak memanggil cloud LLM.
+
+Observability: logging (Pino), metrics ringan.
+
+2. Struktur repo contoh
+Kode
+Salin
+ai-agent-sqlite/
+├─ server/
+│  ├─ src/
+│  │  ├─ modules/
+│  │  │  ├─ agent/
+│  │  │  │  ├─ agent.controller.ts
+│  │  │  │  ├─ agent.service.ts
+│  │  │  ├─ ingest/
+│  │  │  ├─ exec/
+│  │  ├─ db/
+│  │  │  ├─ sqlite.ts
+│  │  │  ├─ migrations.sql
+│  │  ├─ main.ts
+│  ├─ Dockerfile
+├─ sandbox/
+│  ├─ Dockerfile.sandbox
+│  ├─ runner.sh
+├─ sqlite_extensions/
+│  ├─ libsqliteai.so   (SQLite-AI native extension)
+├─ frontend/
+│  ├─ index.html
+│  ├─ app.js
+└─ README.md
+3. Skema SQLite & integrasi SQLite‑AI (contoh)
+DB tables (ringkas):
+
+sql
+Salin
+-- migrations.sql
+CREATE TABLE snippets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  language TEXT NOT NULL,
+  filename TEXT,
+  content TEXT NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE embeddings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  snippet_id INTEGER NOT NULL,
+  vector BLOB NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(snippet_id) REFERENCES snippets(id)
+);
+
+CREATE TABLE history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  query TEXT,
+  response TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+Memuat extension SQLite‑AI di Node.js (better-sqlite3 contoh):
+
+ts
+Salin
+// server/src/db/sqlite.ts
+import Database from 'better-sqlite3';
+import path from 'path';
+
+const DB_PATH = path.resolve(__dirname, '../../data/data.db');
+const EXT_PATH = path.resolve(__dirname, '../../sqlite_extensions/libsqliteai.so');
+
+export function initDb() {
+  const db = new Database(DB_PATH);
+  // load sqlite-ai extension (native .so/.dll)
+  db.loadExtension(EXT_PATH);
+  // jalankan migrations jika perlu
+  const migrations = require('./migrations.sql'); // atau baca file dan exec
+  // ... apply migrations
+  return db;
+}
+Catatan: nama file extension dan cara build tergantung distribusi SQLite‑AI; pastikan Anda membangun extension sesuai platform (Linux x86_64 untuk server lokal).
+
+4. Contoh alur pembuatan embedding & query retrieval
+Membuat embedding (SQL UDF dari sqlite‑ai):
+
+ts
+Salin
+// server/src/modules/agent/agent.service.ts (pseudocode)
+import { initDb } from '../../db/sqlite';
+
+const db = initDb();
+
+export function createEmbedding(snippetId: number, text: string) {
+  // sqlite-ai menyediakan fungsi seperti ai_embedding(text, model, options)
+  const stmt = db.prepare(`INSERT INTO embeddings (snippet_id, vector) VALUES (?, ai_embedding(?, 'small-model'))`);
+  stmt.run(snippetId, text);
+}
+Retrieval berbasis similarity (contoh SQL):
+
+sql
+Salin
+-- contoh SQL: cari 5 snippet terdekat
+SELECT s.id, s.filename, s.content
+FROM snippets s
+JOIN embeddings e ON e.snippet_id = s.id
+ORDER BY ai_cosine_similarity(e.vector, ai_embedding(:query, 'small-model')) DESC
+LIMIT 5;
+Penjelasan: ai_embedding dan ai_cosine_similarity adalah fungsi contoh yang disediakan extension SQLite‑AI; API nama fungsi bisa berbeda—sesuaikan dengan dokumentasi extension yang Anda gunakan.
+
+5. Endpoint API inti (Express + TypeScript) — contoh minimal
+main.ts
+
+ts
+Salin
+import express from 'express';
+import bodyParser from 'body-parser';
+import { agentRouter } from './modules/agent/agent.controller';
+
+const app = express();
+app.use(bodyParser.json());
+app.use('/api/agent', agentRouter);
+
+app.listen(3000, () => console.log('Server running on :3000'));
+agent.controller.ts
+
+ts
+Salin
+import { Router } from 'express';
+import { handleQuery } from './agent.service';
+
+export const agentRouter = Router();
+
+agentRouter.post('/query', async (req, res) => {
+  const { query, language } = req.body;
+  try {
+    const result = await handleQuery(query, language);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+agent.service.ts (alur):
+
+Buat embedding query on‑the‑fly via ai_embedding.
+
+Lakukan retrieval SQL untuk snippet relevan.
+
+Gabungkan konteks (top‑k snippets) menjadi prompt.
+
+Panggil fungsi inference on‑device via SQLite‑AI (mis. ai_generate(prompt, model)).
+
+Simpan history dan kembalikan response.
+
+Contoh panggilan generate (pseudocode):
+
+ts
+Salin
+function handleQuery(query: string, language: string) {
+  // 1. retrieval
+  const rows = db.prepare(`SELECT s.content FROM snippets s JOIN embeddings e ON e.snippet_id=s.id
+    ORDER BY ai_cosine_similarity(e.vector, ai_embedding(?, 'small-model')) DESC LIMIT 5`).all(query);
+
+  const context = rows.map(r => r.content).join('\n---\n');
+  const prompt = `You are an assistant for ${language} code. Context:\n${context}\nUser: ${query}\nAnswer:`;
+
+  // 2. generate via sqlite-ai UDF
+  const genStmt = db.prepare(`SELECT ai_generate(?, 'small-model', json('{ "max_tokens": 512 }')) as output`);
+  const out = genStmt.get(prompt);
+  // 3. save history
+  db.prepare(`INSERT INTO history (query, response) VALUES (?, ?)`).run(query, out.output);
+  return { answer: out.output };
+}
+6. Sandbox eksekusi kode (safety)
+Metode: jalankan kode di ephemeral Docker container dengan:
+
+Network disabled (--network none)
+
+CPU & memory limits (--cpus, --memory)
+
+No persistent volumes (ephemeral FS)
+
+Timeout enforced (kill container setelah N detik)
+
+Contoh runner script (shell):
+
+sh
+Salin
+#!/bin/bash
+CODE_FILE="$1"
+LANG="$2"
+docker run --rm --network none --cpus="0.5" --memory="256m" \
+  -v "$(pwd)/tmp/$CODE_FILE":/workspace/code \
+  --workdir /workspace \
+  node:18 bash -lc "timeout 10s node code"
+Alternatif lebih aman: Firecracker microVM atau gVisor untuk isolasi lebih kuat.
+
+7. Dockerfile contoh untuk server (ringkas)
+dockerfile
+Salin
+# server/Dockerfile
+FROM node:18
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+# pastikan libsqliteai.so disertakan di /usr/local/lib
+COPY ../sqlite_extensions/libsqliteai.so /usr/local/lib/libsqliteai.so
+RUN npm run build
+EXPOSE 3000
+CMD ["node", "dist/main.js"]
+Catatan: Anda mungkin perlu ldconfig atau set SQLITE_EXTENSION_DIR agar Node dapat load extension.
+
+8. Keamanan, batasan, dan mitigasi penting
+Model size: model on‑device terbatas; pilih model kecil yang kompatibel dengan sqlite‑ai/llama.cpp.
+
+Eksekusi kode: jangan jalankan kode user tanpa sandbox; batasi resource dan waktu.
+
+Data privacy: semua inference on‑device → data tetap lokal. Enkripsi DB jika perlu.
+
+Scaling: SQLite cocok untuk PoC dan single‑node; jika dataset embeddings tumbuh besar, pertimbangkan sinkron ke vector DB (FAISS/Redis) atau sharding.
+
+Backup: jadwalkan backup file .db.
+
+9. Langkah PoC yang bisa Anda jalankan sekarang (urutan)
+Siapkan environment: mesin Linux x86_64; install Docker.
+
+Build/obtain SQLite‑AI extension: compile atau ambil libsqliteai.so untuk platform Anda.
+
+Clone repo (struktur di atas) dan letakkan extension di sqlite_extensions/.
+
+Jalankan migrations untuk membuat data.db.
+
+Start server: npm install && npm run build && node dist/main.js.
+
+Ingest beberapa snippet via POST /api/ingest atau langsung insert ke DB.
+
+Coba endpoint POST /api/agent/query dengan pertanyaan coding sederhana.
+
+Uji eksekusi: kirim job POST /api/exec/run yang memicu sandbox runner.
+
+10. Next deliverables saya bisa kirim sekarang
+Saya akan langsung sediakan kode PoC berikut bila Anda ingin:
+
+A. Repo minimal Express + TypeScript dengan endpoint /api/agent/query, DB init, dan contoh ingestion script.
+
+B. Dockerfile server + contoh libsqliteai.so placeholder (Anda ganti dengan binary yang sesuai).
+
+C. Script sandbox runner dan contoh test case (Python/Node snippets).
+
+Sebutkan pilihan Anda: A, B, C, atau semua. Saya akan kirimkan potongan kode lengkap untuk pilihan itu dalam pesan berikutnya.
+
+Anda berkata
+berikan juga root dan penamaan modulnya supaya jelas meletakanya
+Copilot berkata
+Struktur root proyek dan penamaan modul
+Berikut struktur root lengkap dengan nama modul dan letak file agar penempatan kode jelas dan konsisten. Saya memakai konvensi TypeScript + Node.js (Express/Nest style) — Anda bisa adaptasi ke Express sederhana atau NestJS sesuai preferensi.
+
+Pohon direktori lengkap
+Kode
+Salin
+ai-agent-sqlite/
+├─ README.md
+├─ package.json
+├─ tsconfig.json
+├─ .env
+├─ docker-compose.yml
+├─ Dockerfile
+├─ sqlite_extensions/
+│  └─ libsqliteai.so
+├─ data/
+│  └─ data.db
+├─ server/
+│  ├─ package.json
+│  ├─ tsconfig.json
+│  ├─ src/
+│  │  ├─ main.ts
+│  │  ├─ app.module.ts
+│  │  ├─ config/
+│  │  │  └─ index.ts
+│  │  ├─ db/
+│  │  │  ├─ sqlite.ts
+│  │  │  └─ migrations.sql
+│  │  ├─ modules/
+│  │  │  ├─ auth/
+│  │  │  │  ├─ auth.controller.ts
+│  │  │  │  ├─ auth.service.ts
+│  │  │  │  └─ auth.types.ts
+│  │  │  ├─ ingest/
+│  │  │  │  ├─ ingest.controller.ts
+│  │  │  │  ├─ ingest.service.ts
+│  │  │  │  └─ ingest.utils.ts
+│  │  │  ├─ agent/
+│  │  │  │  ├─ agent.controller.ts
+│  │  │  │  ├─ agent.service.ts
+│  │  │  │  └─ agent.types.ts
+│  │  │  ├─ exec/
+│  │  │  │  ├─ exec.controller.ts
+│  │  │  │  ├─ exec.service.ts
+│  │  │  │  └─ sandbox.runner.ts
+│  │  │  └─ storage/
+│  │  │     ├─ snippets.repo.ts
+│  │  │     └─ embeddings.repo.ts
+│  │  ├─ workers/
+│  │  │  ├─ queue.ts
+│  │  │  └─ embedding.worker.ts
+│  │  ├─ utils/
+│  │  │  ├─ logger.ts
+│  │  │  └─ validators.ts
+│  │  └─ types/
+│  │     └─ index.d.ts
+│  └─ Dockerfile
+├─ sandbox/
+│  ├─ Dockerfile.sandbox
+│  └─ runner.sh
+└─ frontend/
+   ├─ index.html
+   ├─ app.js
+   └─ styles.css
+Penamaan modul dan tanggung jawab singkat
+server/src/main.ts Tugas: bootstrap aplikasi, load konfigurasi, inisialisasi DB dan worker queue, start HTTP server.
+
+server/src/app.module.ts Tugas: daftar modul utama (Auth, Ingest, Agent, Exec, Storage). Jika menggunakan NestJS ini adalah modul root; untuk Express ini berfungsi sebagai aggregator import.
+
+server/src/config/index.ts Tugas: baca variabel lingkungan dari .env dan expose konfigurasi ter-typed.
+
+server/src/db/sqlite.ts Tugas: inisialisasi koneksi SQLite via better-sqlite3, load libsqliteai.so, jalankan migrations jika perlu. Ekspor: getDb(): Database.
+
+server/src/modules/ingest/ File utama: ingest.controller.ts, ingest.service.ts, ingest.utils.ts Tugas: menerima upload snippet/repo, ekstraksi file, simpan ke snippets table, panggil worker untuk buat embedding.
+
+server/src/modules/agent/ File utama: agent.controller.ts, agent.service.ts, agent.types.ts Tugas: endpoint /api/agent/query — retrieval via SQL UDF ai_embedding/ai_cosine_similarity, assembly prompt, panggil ai_generate UDF, simpan history.
+
+server/src/modules/exec/ File utama: exec.controller.ts, exec.service.ts, sandbox.runner.ts Tugas: menerima permintaan eksekusi, enqueue job, jalankan sandbox/runner.sh di container ephemeral, kembalikan hasil dan logs.
+
+server/src/modules/storage/ File utama: snippets.repo.ts, embeddings.repo.ts Tugas: abstraksi akses DB untuk tabel snippets, embeddings, history. Semua query SQL terpusat di sini.
+
+server/src/workers/ File utama: queue.ts, embedding.worker.ts Tugas: job queue (BullMQ) untuk pembuatan embedding, indexing, verifikasi patch.
+
+server/src/utils/logger.ts Tugas: konfigurasi logger (Pino/Winston) dan ekspor instance logger.
+
+Contoh path import dan nama ekspor yang konsisten
+Gunakan ekspor default atau named export konsisten. Contoh import di agent.service.ts:
+
+ts
+Salin
+// server/src/modules/agent/agent.service.ts
+import { getDb } from '../../db/sqlite';
+import { SnippetsRepo } from '../storage/snippets.repo';
+import { EmbeddingsRepo } from '../storage/embeddings.repo';
+import logger from '../../utils/logger';
+Rekomendasi ekspor:
+
+export function getDb(): Database di sqlite.ts
+
+export class SnippetsRepo { ... } di snippets.repo.ts
+
+export default logger di logger.ts
+
+File contoh kecil untuk memperjelas lokasi dan isi
+server/src/db/sqlite.ts
+
+ts
+Salin
+import Database from 'better-sqlite3';
+import path from 'path';
+
+const DB_PATH = path.resolve(__dirname, '../../data/data.db');
+const EXT_PATH = path.resolve(__dirname, '../../sqlite_extensions/libsqliteai.so');
+
+export function getDb() {
+  const db = new Database(DB_PATH);
+  db.loadExtension(EXT_PATH);
+  // run migrations if needed
+  return db;
+}
+server/src/modules/agent/agent.controller.ts
+
+ts
+Salin
+import { Router } from 'express';
+import { handleQuery } from './agent.service';
+
+export const agentRouter = Router();
+agentRouter.post('/query', async (req, res) => {
+  const { query, language } = req.body;
+  const out = await handleQuery(query, language);
+  res.json(out);
+});
+Langkah selanjutnya yang saya rekomendasikan
+Saya bisa kirim potongan kode PoC lengkap untuk modul db/sqlite.ts, modules/agent/*, modules/ingest/*, dan sandbox/runner.sh sesuai struktur di atas.
+
+Jika Anda ingin, saya juga bisa sertakan skrip migrasi SQL lengkap dan contoh docker-compose.yml untuk menjalankan server + sandbox.
+
+Sebutkan apakah Anda ingin saya kirim kode PoC untuk semua modul sekarang atau mulai dari modul DB + Agent terlebih dahulu.
+
+Anda berkata
+buatkan semuanya
+Copilot berkata
+Ringkasan singkat
+Berikut PoC lengkap untuk proyek AI coding agent on‑device (SQLite‑AI): struktur repo, semua file kode utama (TypeScript + Express), skrip migrasi, runner sandbox, Dockerfile, dan docker-compose.yml. Salin‑tempel file sesuai path yang saya sertakan, lalu jalankan langkah Setup dan Run di bagian akhir.
+
+Struktur root dan file yang akan Anda buat
+Kode
+Salin
+ai-agent-sqlite/
+├─ README.md
+├─ package.json
+├─ tsconfig.json
+├─ .env
+├─ docker-compose.yml
+├─ Dockerfile
+├─ sqlite_extensions/
+│  └─ libsqliteai.so
+├─ data/
+│  └─ data.db
+├─ server/
+│  ├─ package.json
+│  ├─ tsconfig.json
+│  ├─ src/
+│  │  ├─ main.ts
+│  │  ├─ app.module.ts
+│  │  ├─ config/
+│  │  │  └─ index.ts
+│  │  ├─ db/
+│  │  │  ├─ sqlite.ts
+│  │  │  └─ migrations.sql
+│  │  ├─ modules/
+│  │  │  ├─ auth/
+│  │  │  │  ├─ auth.controller.ts
+│  │  │  │  ├─ auth.service.ts
+│  │  │  │  └─ auth.types.ts
+│  │  │  ├─ ingest/
+│  │  │  │  ├─ ingest.controller.ts
+│  │  │  │  ├─ ingest.service.ts
+│  │  │  │  └─ ingest.utils.ts
+│  │  │  ├─ agent/
+│  │  │  │  ├─ agent.controller.ts
+│  │  │  │  ├─ agent.service.ts
+│  │  │  │  └─ agent.types.ts
+│  │  │  ├─ exec/
+│  │  │  │  ├─ exec.controller.ts
+│  │  │  │  ├─ exec.service.ts
+│  │  │  │  └─ sandbox.runner.ts
+│  │  │  └─ storage/
+│  │  │     ├─ snippets.repo.ts
+│  │  │     └─ embeddings.repo.ts
+│  │  ├─ workers/
+│  │  │  ├─ queue.ts
+│  │  │  └─ embedding.worker.ts
+│  │  ├─ utils/
+│  │  │  ├─ logger.ts
+│  │  │  └─ validators.ts
+│  │  └─ types/
+│  │     └─ index.d.ts
+│  └─ Dockerfile
+├─ sandbox/
+│  ├─ Dockerfile.sandbox
+│  └─ runner.sh
+└─ frontend/
+   ├─ index.html
+   ├─ app.js
+   └─ styles.css
+Setup environment and dependensi
+Prasyarat
+
+Linux x86_64 (atau sesuaikan libsqliteai.so untuk platform Anda)
+
+Node.js 18+ dan npm
+
+Docker & docker‑compose
+
+Root package.json (ringkas)
+
+json
+Salin
+{
+  "name": "ai-agent-sqlite",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "start": "node dist/main.js",
+    "dev": "ts-node-dev --respawn --transpile-only server/src/main.ts",
+    "build": "tsc -p server/tsconfig.json"
+  }
+}
+server/package.json
+
+json
+Salin
+{
+  "name": "ai-agent-sqlite-server",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/main.js",
+  "scripts": {
+    "start": "node dist/main.js",
+    "dev": "ts-node-dev --respawn --transpile-only src/main.ts",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "better-sqlite3": "^8.0.0",
+    "express": "^4.18.2",
+    "body-parser": "^1.20.2",
+    "bullmq": "^2.8.0",
+    "ioredis": "^5.3.2",
+    "pino": "^8.0.0",
+    "dotenv": "^16.0.0"
+  },
+  "devDependencies": {
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.0.0",
+    "@types/express": "^4.17.17"
+  }
+}
+Kode inti server files
+Berikut potongan lengkap tiap file utama. Simpan persis di path yang ditunjukkan.
+
+server/src/main.ts
+ts
+Salin
+import express from 'express';
+import bodyParser from 'body-parser';
+import dotenv from 'dotenv';
+import { initDb } from './db/sqlite';
+import { agentRouter } from './modules/agent/agent.controller';
+import { ingestRouter } from './modules/ingest/ingest.controller';
+import { execRouter } from './modules/exec/exec.controller';
+import logger from './utils/logger';
+
+dotenv.config();
+
+const app = express();
+app.use(bodyParser.json());
+
+const db = initDb();
+app.locals.db = db;
+
+app.use('/api/agent', agentRouter);
+app.use('/api/ingest', ingestRouter);
+app.use('/api/exec', execRouter);
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  logger.info(`Server listening on ${PORT}`);
+});
+Keamanan dan batasan penting
+sqlite‑ai binary harus kompatibel dengan platform. Jika tidak tersedia, server tetap jalan tapi fungsi embedding/generate akan fallback.
+
+Sandbox di runner.sh menggunakan Docker dengan --network none dan resource limits; ini bukan pengganti isolasi produksi. Untuk produksi gunakan Firecracker, gVisor, atau sandboxing tingkat kernel.
+
+SQLite cocok untuk PoC dan single‑node. Untuk dataset besar atau multi‑node, sinkron ke vector DB (FAISS/Redis) diperlukan.
+
+Model size: on‑device model harus kecil; jika butuh kemampuan besar, pertimbangkan hybrid cloud.
+
+Penutup dan langkah berikutnya
+Semua file di atas adalah PoC lengkap. Jika Anda ingin, saya bisa:
+
+(A) berikan file server/src sebagai satu paket kode (potongan per file sudah disediakan).
+
+(B) tambahkan contoh unit test sederhana dan script migrasi otomatis.
+
+(C) bantu sesuaikan libsqliteai.so build instruksi untuk Linux x86_64.
+
+Pilih salah satu opsi di atas untuk saya kirimkan detail tambahan atau langsung mulai implementasi.
+
+Anda berkata
+langsung mulai implementasi
+Copilot berkata
+Langkah cepat untuk mulai implementasi sekarang
+Berikut urutan tindakan praktis yang bisa Anda jalankan di mesin (Linux x86_64) di Mijen sekarang. Ikuti langkah satu per satu tanpa melewatkan bagian sqlite‑ai karena itu kunci PoC on‑device.
+
+1. Siapkan lingkungan dan dependensi sistem
+Install sistem paket
+
+bash
+Salin
+sudo apt update
+sudo apt install -y build-essential cmake git docker.io docker-compose sqlite3 libsqlite3-dev
+sudo usermod -aG docker $USER
+Login ulang atau jalankan newgrp docker agar user bisa menjalankan Docker tanpa sudo.
+
+Node dan npm (jika belum):
+
+bash
+Salin
+7. Troubleshooting umum dan solusi cepat
+sqlite‑ai extension tidak terload
+
+Periksa path SQLITE_AI_EXT di .env atau docker-compose.yml.
+
+Jalankan ldd libsqliteai.so untuk cek dependensi native.
+
+Jika extension gagal, server tetap jalan tapi fungsi embedding/generate akan fallback; Anda masih bisa menguji ingest, retrieval fallback, dan sandbox.
+
+Docker runner gagal karena permission
+
+Pastikan user ada di group docker dan daemon berjalan: sudo systemctl start docker.
+
+Worker queue tidak memproses job
+
+Pastikan Redis berjalan dan REDIS_URL benar. Cek logs worker jika Anda menjalankan worker terpisah.
+
+Timeout sandbox
+
+Periksa runner.sh timeout dan resource limits; sesuaikan --cpus dan --memory jika perlu.
+
+8. Langkah berikutnya yang saya jalankan untuk Anda sekarang
+Saya akan membantu Anda langkah demi langkah sampai PoC berjalan. Saya akan:
+
+A. kirimkan paket file server/src lengkap sebagai potongan per file (sudah saya berikan sebelumnya).
+
+B. bantu menyesuaikan instruksi build libsqliteai.so jika Anda beri tahu apakah Anda punya source repo atau butuh rekomendasi repo.
+
+C. jika Anda ingin, saya bisa langsung berikan skrip shell yang membuat skeleton file dan menulis file‑file utama secara otomatis agar Anda tinggal menjalankan satu skrip di mesin Anda.
+
+Pilih salah satu dari A, B, atau C sekarang dan saya akan lanjutkan tanpa menunggu klarifikasi lain.
+
+Anda berkata
+c
+Copilot berkata
+Skrip otomatis untuk membuat skeleton PoC (on‑device SQLite‑AI)
+Berikut skrip create_poc.sh yang akan membuat struktur proyek dan menulis file‑file PoC utama sesuai blueprint sebelumnya. Simpan skrip ini di mesin Anda (mis. ~/ai-agent-sqlite/create_poc.sh), beri izin eksekusi, lalu jalankan. Setelah skrip selesai, Anda tinggal menempatkan libsqliteai.so ke folder sqlite_extensions/ dan mengikuti langkah build/run.
+
+Catatan penting: skrip ini membuat file teks besar. Periksa dan sesuaikan bila perlu (mis. path, image Docker, atau konfigurasi). Skrip tidak mengunduh atau membangun libsqliteai.so — Anda harus menyediakan binary yang kompatibel sendiri.
+
+bash
+Salin
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="${1:-./ai-agent-sqlite}"
+echo "Membuat project skeleton di: $ROOT_DIR"
+
+mkdir -p "$ROOT_DIR"
+cd "$ROOT_DIR"
+
+# Root package.json
+cat > package.json <<'EOF'
+{
+  "name": "ai-agent-sqlite",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "start": "node dist/main.js",
+    "dev": "ts-node-dev --respawn --transpile-only server/src/main.ts",
+    "build": "tsc -p server/tsconfig.json"
+  }
+}
+EOF
+
+# Create directories
+mkdir -p server/src/{config,db,modules/{auth,ingest,agent,exec,storage},workers,utils,types}
+mkdir -p sqlite_extensions data sandbox frontend
+
+# server/package.json
+cat > server/package.json <<'EOF'
+{
+  "name": "ai-agent-sqlite-server",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/main.js",
+  "scripts": {
+    "start": "node dist/main.js",
+    "dev": "ts-node-dev --respawn --transpile-only src/main.ts",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "better-sqlite3": "^8.0.0",
+    "express": "^4.18.2",
+    "body-parser": "^1.20.2",
+    "bullmq": "^2.8.0",
+    "ioredis": "^5.3.2",
+    "pino": "^8.0.0",
+    "dotenv": "^16.0.0"
+  },
+  "devDependencies": {
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.0.0",
+    "@types/express": "^4.17.17"
+  }
+}
+EOF
+
+# server/tsconfig.json
+cat > server/tsconfig.json <<'EOF'
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "CommonJS",
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  },
+  "include": ["src"]
+}
+EOF
+
+# server/src/main.ts
+cat > server/src/main.ts <<'EOF'
+import express from 'express';
+import bodyParser from 'body-parser';
+import dotenv from 'dotenv';
+import { initDb } from './db/sqlite';
+import { agentRouter } from './modules/agent/agent.controller';
+import { ingestRouter } from './modules/ingest/ingest.controller';
+import { execRouter } from './modules/exec/exec.controller';
+import logger from './utils/logger';
+import { startEmbeddingWorker } from './workers/embedding.worker';
+
+dotenv.config();
+
+const app = express();
+app.use(bodyParser.json());
+
+const db = initDb();
+app.locals.db = db;
+
+// start worker (in-process for PoC)
+startEmbeddingWorker(db);
+
+app.use('/api/agent', agentRouter);
+app.use('/api/ingest', ingestRouter);
+app.use('/api/exec', execRouter);
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  logger.info(`Server listening on ${PORT}`);
+});
+EOF
+
+# server/src/config/index.ts
+cat > server/src/config/index.ts <<'EOF'
+import dotenv from 'dotenv';
+dotenv.config();
+
+export default {
+  PORT: process.env.PORT || '3000',
+  DB_PATH: process.env.DB_PATH || './data/data.db',
+  SQLITE_AI_EXT: process.env.SQLITE_AI_EXT || './sqlite_extensions/libsqliteai.so',
+  SANDBOX_IMAGE: process.env.SANDBOX_IMAGE || 'node:18',
+  REDIS_URL: process.env.REDIS_URL || 'redis://localhost:6379'
+};
+EOF
+
+# server/src/db/migrations.sql
+cat > server/src/db/migrations.sql <<'EOF'
+CREATE TABLE IF NOT EXISTS snippets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  language TEXT NOT NULL,
+  filename TEXT,
+  content TEXT NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS embeddings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  snippet_id INTEGER NOT NULL,
+  vector BLOB NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(snippet_id) REFERENCES snippets(id)
+);
+
+CREATE TABLE IF NOT EXISTS history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  query TEXT,
+  response TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+EOF
+
+# server/src/db/sqlite.ts
+cat > server/src/db/sqlite.ts <<'EOF'
+import Database from 'better-sqlite3';
+import fs from 'fs';
+import path from 'path';
+import config from '../config';
+import logger from '../utils/logger';
+
+export function initDb() {
+  const dbPath = path.resolve(process.cwd(), config.DB_PATH);
+  const extPath = path.resolve(process.cwd(), config.SQLITE_AI_EXT);
+
+  if (!fs.existsSync(path.dirname(dbPath))) {
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  }
+
+  const db = new Database(dbPath);
+  try {
+    if (fs.existsSync(extPath)) {
+      db.loadExtension(extPath);
+      logger.info('Loaded sqlite-ai extension from ' + extPath);
+    } else {
+      logger.warn('sqlite-ai extension not found at ' + extPath);
+    }
+  } catch (err) {
+    logger.error('Failed to load sqlite extension: ' + String(err));
+  }
+
+  const migrations = fs.readFileSync(path.resolve(__dirname, 'migrations.sql'), 'utf8');
+  db.exec(migrations);
+  return db;
+}
+EOF
+
+# modules agent
+cat > server/src/modules/agent/agent.controller.ts <<'EOF'
+import { Router } from 'express';
+import { handleQuery } from './agent.service';
+
+export const agentRouter = Router();
+
+agentRouter.post('/query', async (req, res) => {
+  const { query, language } = req.body;
+  try {
+    const out = await handleQuery(req.app.locals.db, query, language || 'javascript');
+    res.json(out);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+EOF
+
+cat > server/src/modules/agent/agent.service.ts <<'EOF'
+import Database from 'better-sqlite3';
+import logger from '../../utils/logger';
+
+export async function handleQuery(db: Database, query: string, language: string) {
+  if (!query) throw new Error('query required');
+
+  // 1. retrieval top 5 via sqlite-ai functions if available
+  let rows;
+  try {
+    const stmt = db.prepare(\`
+      SELECT s.id, s.filename, s.content
+      FROM snippets s
+      JOIN embeddings e ON e.snippet_id = s.id
+      ORDER BY ai_cosine_similarity(e.vector, ai_embedding(?, 'small-model')) DESC
+      LIMIT 5
+    \`);
+    rows = stmt.all(query);
+  } catch (err) {
+    // fallback: simple keyword match
+    logger.warn('sqlite-ai retrieval failed, using fallback: ' + String(err));
+    const stmt = db.prepare(\`SELECT id, filename, content FROM snippets WHERE content LIKE ? LIMIT 5\`);
+    rows = stmt.all(\`%\${query.split(' ').slice(0,3).join('%')}%\`);
+  }
+
+  const context = rows.map(r => \`// \${r.filename || 'snippet'}\n\${r.content}\`).join('\n\n---\n\n');
+
+  const prompt = \`You are an on-device coding assistant for \${language}.\nContext:\n\${context}\nUser: \${query}\nAssistant:\`;
+
+  // 2. generate via sqlite-ai UDF ai_generate if available
+  let output = '';
+  try {
+    const genStmt = db.prepare(\`SELECT ai_generate(?, 'small-model', json('{ "max_tokens": 512 }')) as output\`);
+    const out = genStmt.get(prompt);
+    output = out?.output || '';
+  } catch (err) {
+    logger.warn('sqlite-ai generate failed, returning simple response: ' + String(err));
+    output = 'sqlite-ai not available; fallback: provide guidance based on context.';
+  }
+
+  // 3. save history
+  try {
+    db.prepare(\`INSERT INTO history (query, response) VALUES (?, ?)\`).run(query, output);
+  } catch (err) {
+    logger.warn('Failed to save history: ' + String(err));
+  }
+
+  return { answer: output, contextCount: rows.length };
+}
+EOF
+
+# modules ingest
+cat > server/src/modules/ingest/ingest.controller.ts <<'EOF'
+import { Router } from 'express';
+import { ingestSnippet } from './ingest.service';
+
+export const ingestRouter = Router();
+
+ingestRouter.post('/snippet', async (req, res) => {
+  const { language, filename, content } = req.body;
+  try {
+    const out = await ingestSnippet(req.app.locals.db, { language, filename, content });
+    res.json(out);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+EOF
+
+cat > server/src/modules/ingest/ingest.service.ts <<'EOF'
+import Database from 'better-sqlite3';
+import logger from '../../utils/logger';
+
+export async function ingestSnippet(db: Database, payload: { language: string; filename?: string; content: string }) {
+  const { language, filename, content } = payload;
+  const insert = db.prepare(\`INSERT INTO snippets (language, filename, content) VALUES (?, ?, ?)\`);
+  const info = insert.run(language || 'text', filename || null, content);
+  const snippetId = info.lastInsertRowid as number;
+
+  // create embedding via sqlite-ai if available
+  try {
+    const embStmt = db.prepare(\`INSERT INTO embeddings (snippet_id, vector) VALUES (?, ai_embedding(?, 'small-model'))\`);
+    embStmt.run(snippetId, content);
+  } catch (err) {
+    logger.warn('Failed to create embedding: ' + String(err));
+  }
+
+  return { id: snippetId };
+}
+EOF
+
+# modules exec
+cat > server/src/modules/exec/exec.controller.ts <<'EOF'
+import { Router } from 'express';
+import { runCode } from './exec.service';
+
+export const execRouter = Router();
+
+execRouter.post('/run', async (req, res) => {
+  const { language, code } = req.body;
+  try {
+    const out = await runCode(language || 'javascript', code);
+    res.json(out);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+EOF
+
+cat > server/src/modules/exec/exec.service.ts <<'EOF'
+import { spawn } from 'child_process';
+import path from 'path';
+import fs from 'fs';
+import os from 'os';
+import logger from '../../utils/logger';
+
+export async function runCode(language: string, code: string) {
+  // write temp file
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-agent-'));
+  const filename = language === 'python' ? 'code.py' : 'code.js';
+  const filePath = path.join(tmpDir, filename);
+  fs.writeFileSync(filePath, code, 'utf8');
+
+  // call sandbox runner script
+  const runner = path.resolve(process.cwd(), 'sandbox', 'runner.sh');
+  return new Promise((resolve) => {
+    const proc = spawn('bash', [runner, filePath, language], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (d) => (stdout += d.toString()));
+    proc.stderr.on('data', (d) => (stderr += d.toString()));
+    proc.on('close', (codeExit) => {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+      resolve({ exitCode: codeExit, stdout, stderr });
+    });
+  });
+}
+EOF
+
+# storage repos
+cat > server/src/modules/storage/snippets.repo.ts <<'EOF'
+import Database from 'better-sqlite3';
+
+export class SnippetsRepo {
+  db: Database;
+  constructor(db: Database) { this.db = db; }
+
+  create(language: string, filename: string | null, content: string) {
+    const stmt = this.db.prepare(`INSERT INTO snippets (language, filename, content) VALUES (?, ?, ?)`);
+    return stmt.run(language, filename, content);
+  }
+
+  findById(id: number) {
+    return this.db.prepare(`SELECT * FROM snippets WHERE id = ?`).get(id);
+  }
+}
+EOF
+
+cat > server/src/modules/storage/embeddings.repo.ts <<'EOF'
+import Database from 'better-sqlite3';
+
+export class EmbeddingsRepo {
+  db: Database;
+  constructor(db: Database) { this.db = db; }
+
+  insert(snippetId: number, vector: Buffer) {
+    const stmt = this.db.prepare(`INSERT INTO embeddings (snippet_id, vector) VALUES (?, ?)`);
+    return stmt.run(snippetId, vector);
+  }
+}
+EOF
+
+# workers
+cat > server/src/workers/queue.ts <<'EOF'
+import { Queue } from 'bullmq';
+import config from '../config';
+import IORedis from 'ioredis';
+
+const connection = new IORedis(config.REDIS_URL);
+export const embeddingQueue = new Queue('embeddings', { connection });
+EOF
+
+cat > server/src/workers/embedding.worker.ts <<'EOF'
+import { Worker } from 'bullmq';
+import IORedis from 'ioredis';
+import config from '../config';
+import logger from '../utils/logger';
+import Database from 'better-sqlite3';
+
+const connection = new IORedis(config.REDIS_URL);
+
+export function startEmbeddingWorker(db: Database) {
+  const worker = new Worker('embeddings', async job => {
+    const { snippetId, content } = job.data;
+    try {
+      // create embedding via sqlite-ai UDF
+      db.prepare(\`INSERT INTO embeddings (snippet_id, vector) VALUES (?, ai_embedding(?, 'small-model'))\`).run(snippetId, content);
+      logger.info(\`Created embedding for snippet \${snippetId}\`);
+    } catch (err) {
+      logger.error('Embedding worker error: ' + String(err));
+    }
+  }, { connection });
+
+  worker.on('failed', (job, err) => {
+    logger.error(\`Job \${job.id} failed: \${err}\`);
+  });
+}
+EOF
+
+# utils
+cat > server/src/utils/logger.ts <<'EOF'
+import pino from 'pino';
+const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
+export default logger;
+EOF
+
+# frontend
+cat > frontend/index.html <<'EOF'
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>AI Agent PoC</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <h1>AI Agent PoC</h1>
+  <textarea id="query" placeholder="Ask about code or request a fix"></textarea>
+  <select id="lang"><option>javascript</option><option>python</option></select>
+  <button id="send">Send</button>
+  <pre id="out"></pre>
+  <script src="app.js"></script>
+</body>
+</html>
+EOF
+
+cat > frontend/app.js <<'EOF'
+document.getElementById('send').onclick = async () => {
+  const q = document.getElementById('query').value;
+  const lang = document.getElementById('lang').value;
+  const res = await fetch('/api/agent/query', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ query: q, language: lang })
+  });
+  const j = await res.json();
+  document.getElementById('out').textContent = JSON.stringify(j, null, 2);
+};
+EOF
+
+cat > frontend/styles.css <<'EOF'
+body { font-family: Arial, sans-serif; padding: 20px; }
+textarea { width: 100%; height: 120px; }
+pre { background:#f4f4f4; padding:10px; }
+EOF
+
+# sandbox runner
+cat > sandbox/runner.sh <<'EOF'
+#!/bin/bash
+set -e
+CODE_FILE="$1"
+LANG="$2"
+
+IMAGE="node:18"
+if [ "$LANG" = "python" ]; then
+  IMAGE="python:3.11-slim"
+fi
+
+TMPDIR=$(mktemp -d)
+cp "$CODE_FILE" "$TMPDIR/code"
+
+docker run --rm --network none --cpus="0.5" --memory="256m" -v "$TMPDIR":/workspace -w /workspace "$IMAGE" bash -lc \
+  "timeout 10s bash -c 'if [ -f code ]; then if [ \"$LANG\" = \"python\" ]; then python code; else node code; fi; fi'"
+
+rm -rf "$TMPDIR"
+EOF
+chmod +x sandbox/runner.sh
+
+# Dockerfile root
+cat > Dockerfile <<'EOF'
+FROM node:18
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --production
+COPY . .
+WORKDIR /app/server
+RUN npm ci
+RUN npm run build
+COPY sqlite_extensions/libsqliteai.so /usr/local/lib/libsqliteai.so
+ENV LD_PRELOAD=/usr/local/lib/libsqliteai.so
+EXPOSE 3000
+CMD ["node", "dist/main.js"]
+EOF
+
+# docker-compose.yml
+cat > docker-compose.yml <<'EOF'
+version: '3.8'
+services:
+  redis:
+    image: redis:7
+    ports: ['6379:6379']
+  server:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+      - ./sqlite_extensions:/app/sqlite_extensions
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DB_PATH=/app/data/data.db
+      - SQLITE_AI_EXT=/app/sqlite_extensions/libsqliteai.so
+    depends_on:
+      - redis
+EOF
+
+# .env
+cat > .env <<'EOF'
+PORT=3000
+DB_PATH=./data/data.db
+SQLITE_AI_EXT=./sqlite_extensions/libsqliteai.so
+REDIS_URL=redis://localhost:6379
+EOF
+
+# Make data dir and placeholder db
+touch data/.gitkeep
+
+# Make sqlite_extensions placeholder note
+cat > sqlite_extensions/README.txt <<'EOF'
+Place your libsqliteai.so (SQLite-AI extension) here.
+This PoC expects a native extension named libsqliteai.so compatible with your OS/arch.
+EOF
+
+# Make sandbox Dockerfile.sandbox (minimal)
+cat > sandbox/Dockerfile.sandbox <<'EOF'
+FROM node:18
+WORKDIR /workspace
+EOF
+
+# Make server/src/types/index.d.ts (empty placeholder)
+cat > server/src/types/index.d.ts <<'EOF'
+/* Type placeholders */
+EOF
+
+echo "Skeleton project created."
+
+echo
+echo "Next steps:"
+echo "1) Place your libsqliteai.so into: $ROOT_DIR/sqlite_extensions/libsqliteai.so"
+echo "2) Install dependencies:"
+echo "   cd $ROOT_DIR/server && npm install"
+echo "3) Build server:"
+echo "   cd $ROOT_DIR/server && npm run build"
+echo "4) Start services with docker-compose:"
+echo "   cd $ROOT_DIR && docker-compose up --build"
+echo
+echo "After server up, test endpoints:"
+echo " - Ingest snippet: POST /api/ingest/snippet"
+echo " - Query agent: POST /api/agent/query"
+echo " - Run code: POST /api/exec/run"
+echo
+echo "Jika Anda ingin, saya bisa kirimkan perintah curl contoh untuk pengujian otomatis."
+Cara menjalankan skrip
+Simpan skrip di mesin Anda, mis. ~/create_poc.sh.
+
+Beri izin eksekusi:
+
+Letakkan libsqliteai.so ke ~/ai-agent-sqlite/sqlite_extensions/.
+
+Ikuti instruksi output skrip untuk npm install, npm run build, dan docker-compose up --build.
+
+Jika Anda mau, saya bisa langsung kirimkan contoh curl untuk menguji endpoint setelah server berjalan, atau saya bisa bantu menyesuaikan skrip agar otomatis meng-install npm deps dan menjalankan docker-compose up (perlu konfirmasi karena itu akan menjalankan proses di mesin Anda). Pilih salah satu: kirim curl test, atau tambahkan langkah otomatisasi instalasi dan run ke skrip.
+
+Anda berkata
+tambahkan langkah otomatis dan rum ke skrip
+Copilot berkata
+Skrip otomatis lengkap (membuat skeleton, install deps, build, dan jalankan)
+Simpan sebagai create_poc.sh, beri izin eksekusi, lalu jalankan. Skrip ini membuat struktur proyek, menulis file PoC, menginstal dependensi Node (root optional), membangun server, dan menjalankan docker‑compose. Jika Anda ingin hanya membuat skeleton tanpa menjalankan instalasi/compose, jalankan tanpa argumen; untuk otomatis penuh jalankan dengan --auto.
+
+bash
+Salin
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Usage:
+#   ./create_poc.sh [TARGET_DIR] [--auto]
+# Examples:
+#   ./create_poc.sh ./ai-agent-sqlite
+#   ./create_poc.sh ~/ai-agent-sqlite --auto
+#
+# --auto : setelah membuat skeleton, script akan:
+#   - npm install di server/
+#   - npm run build di server/
+#   - docker-compose up --build -d
+#
+# IMPORTANT: script tidak mengunduh atau membangun libsqliteai.so.
+# Letakkan libsqliteai.so di <TARGET_DIR>/sqlite_extensions/ sebelum menjalankan docker-compose.
+
+ROOT_DIR="${1:-./ai-agent-sqlite}"
+AUTO_FLAG="${2:-}"
+
+echo "Target project dir: $ROOT_DIR"
+echo "Auto mode: ${AUTO_FLAG}"
+
+mkdir -p "$ROOT_DIR"
+cd "$ROOT_DIR"
+
+# --- create root package.json
+cat > package.json <<'EOF'
+{
+  "name": "ai-agent-sqlite",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "start": "node dist/main.js",
+    "dev": "ts-node-dev --respawn --transpile-only server/src/main.ts",
+    "build": "tsc -p server/tsconfig.json"
+  }
+}
+EOF
+
+# --- create directories
+mkdir -p server/src/{config,db,modules/{auth,ingest,agent,exec,storage},workers,utils,types}
+mkdir -p sqlite_extensions data sandbox frontend
+
+# --- server package.json
+cat > server/package.json <<'EOF'
+{
+  "name": "ai-agent-sqlite-server",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/main.js",
+  "scripts": {
+    "start": "node dist/main.js",
+    "dev": "ts-node-dev --respawn --transpile-only src/main.ts",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "better-sqlite3": "^8.0.0",
+    "express": "^4.18.2",
+    "body-parser": "^1.20.2",
+    "bullmq": "^2.8.0",
+    "ioredis": "^5.3.2",
+    "pino": "^8.0.0",
+    "dotenv": "^16.0.0"
+  },
+  "devDependencies": {
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.0.0",
+    "@types/express": "^4.17.17"
+  }
+}
+EOF
+
+# --- server tsconfig
+cat > server/tsconfig.json <<'EOF'
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "CommonJS",
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  },
+  "include": ["src"]
+}
+EOF
+
+# --- server/src/main.ts
+cat > server/src/main.ts <<'EOF'
+import express from 'express';
+import bodyParser from 'body-parser';
+import dotenv from 'dotenv';
+import { initDb } from './db/sqlite';
+import { agentRouter } from './modules/agent/agent.controller';
+import { ingestRouter } from './modules/ingest/ingest.controller';
+import { execRouter } from './modules/exec/exec.controller';
+import logger from './utils/logger';
+import { startEmbeddingWorker } from './workers/embedding.worker';
+
+dotenv.config();
+
+const app = express();
+app.use(bodyParser.json());
+
+const db = initDb();
+app.locals.db = db;
+
+// start worker (in-process for PoC)
+startEmbeddingWorker(db);
+
+app.use('/api/agent', agentRouter);
+app.use('/api/ingest', ingestRouter);
+app.use('/api/exec', execRouter);
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  logger.info(`Server listening on ${PORT}`);
+});
+EOF
+
+# --- config
+cat > server/src/config/index.ts <<'EOF'
+import dotenv from 'dotenv';
+dotenv.config();
+
+export default {
+  PORT: process.env.PORT || '3000',
+  DB_PATH: process.env.DB_PATH || './data/data.db',
+  SQLITE_AI_EXT: process.env.SQLITE_AI_EXT || './sqlite_extensions/libsqliteai.so',
+  SANDBOX_IMAGE: process.env.SANDBOX_IMAGE || 'node:18',
+  REDIS_URL: process.env.REDIS_URL || 'redis://localhost:6379'
+};
+EOF
+
+# --- migrations
+cat > server/src/db/migrations.sql <<'EOF'
+CREATE TABLE IF NOT EXISTS snippets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  language TEXT NOT NULL,
+  filename TEXT,
+  content TEXT NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS embeddings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  snippet_id INTEGER NOT NULL,
+  vector BLOB NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(snippet_id) REFERENCES snippets(id)
+);
+
+CREATE TABLE IF NOT EXISTS history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  query TEXT,
+  response TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+EOF
+
+# --- sqlite init
+cat > server/src/db/sqlite.ts <<'EOF'
+import Database from 'better-sqlite3';
+import fs from 'fs';
+import path from 'path';
+import config from '../config';
+import logger from '../utils/logger';
+
+export function initDb() {
+  const dbPath = path.resolve(process.cwd(), config.DB_PATH);
+  const extPath = path.resolve(process.cwd(), config.SQLITE_AI_EXT);
+
+  if (!fs.existsSync(path.dirname(dbPath))) {
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  }
+
+  const db = new Database(dbPath);
+  try {
+    if (fs.existsSync(extPath)) {
+      db.loadExtension(extPath);
+      logger.info('Loaded sqlite-ai extension from ' + extPath);
+    } else {
+      logger.warn('sqlite-ai extension not found at ' + extPath);
+    }
+  } catch (err) {
+    logger.error('Failed to load sqlite extension: ' + String(err));
+  }
+
+  const migrations = fs.readFileSync(path.resolve(__dirname, 'migrations.sql'), 'utf8');
+  db.exec(migrations);
+  return db;
+}
+EOF
+
+# --- agent module
+cat > server/src/modules/agent/agent.controller.ts <<'EOF'
+import { Router } from 'express';
+import { handleQuery } from './agent.service';
+
+export const agentRouter = Router();
+
+agentRouter.post('/query', async (req, res) => {
+  const { query, language } = req.body;
+  try {
+    const out = await handleQuery(req.app.locals.db, query, language || 'javascript');
+    res.json(out);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+EOF
+
+cat > server/src/modules/agent/agent.service.ts <<'EOF'
+import Database from 'better-sqlite3';
+import logger from '../../utils/logger';
+
+export async function handleQuery(db: Database, query: string, language: string) {
+  if (!query) throw new Error('query required');
+
+  // 1. retrieval top 5 via sqlite-ai functions if available
+  let rows;
+  try {
+    const stmt = db.prepare(\`
+      SELECT s.id, s.filename, s.content
+      FROM snippets s
+      JOIN embeddings e ON e.snippet_id = s.id
+      ORDER BY ai_cosine_similarity(e.vector, ai_embedding(?, 'small-model')) DESC
+      LIMIT 5
+    \`);
+    rows = stmt.all(query);
+  } catch (err) {
+    // fallback: simple keyword match
+    logger.warn('sqlite-ai retrieval failed, using fallback: ' + String(err));
+    const stmt = db.prepare(\`SELECT id, filename, content FROM snippets WHERE content LIKE ? LIMIT 5\`);
+    rows = stmt.all(\`%\${query.split(' ').slice(0,3).join('%')}%\`);
+  }
+
+  const context = rows.map(r => \`// \${r.filename || 'snippet'}\n\${r.content}\`).join('\n\n---\n\n');
+
+  const prompt = \`You are an on-device coding assistant for \${language}.\nContext:\n\${context}\nUser: \${query}\nAssistant:\`;
+
+  // 2. generate via sqlite-ai UDF ai_generate if available
+  let output = '';
+  try {
+    const genStmt = db.prepare(\`SELECT ai_generate(?, 'small-model', json('{ "max_tokens": 512 }')) as output\`);
+    const out = genStmt.get(prompt);
+    output = out?.output || '';
+  } catch (err) {
+    logger.warn('sqlite-ai generate failed, returning simple response: ' + String(err));
+    output = 'sqlite-ai not available; fallback: provide guidance based on context.';
+  }
+
+  // 3. save history
+  try {
+    db.prepare(\`INSERT INTO history (query, response) VALUES (?, ?)\`).run(query, output);
+  } catch (err) {
+    logger.warn('Failed to save history: ' + String(err));
+  }
+
+  return { answer: output, contextCount: rows.length };
+}
+EOF
+
+# --- ingest module
+cat > server/src/modules/ingest/ingest.controller.ts <<'EOF'
+import { Router } from 'express';
+import { ingestSnippet } from './ingest.service';
+
+export const ingestRouter = Router();
+
+ingestRouter.post('/snippet', async (req, res) => {
+  const { language, filename, content } = req.body;
+  try {
+    const out = await ingestSnippet(req.app.locals.db, { language, filename, content });
+    res.json(out);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+EOF
+
+cat > server/src/modules/ingest/ingest.service.ts <<'EOF'
+import Database from 'better-sqlite3';
+import logger from '../../utils/logger';
+
+export async function ingestSnippet(db: Database, payload: { language: string; filename?: string; content: string }) {
+  const { language, filename, content } = payload;
+  const insert = db.prepare(\`INSERT INTO snippets (language, filename, content) VALUES (?, ?, ?)\`);
+  const info = insert.run(language || 'text', filename || null, content);
+  const snippetId = info.lastInsertRowid as number;
+
+  // create embedding via sqlite-ai if available
+  try {
+    const embStmt = db.prepare(\`INSERT INTO embeddings (snippet_id, vector) VALUES (?, ai_embedding(?, 'small-model'))\`);
+    embStmt.run(snippetId, content);
+  } catch (err) {
+    logger.warn('Failed to create embedding: ' + String(err));
+  }
+
+  return { id: snippetId };
+}
+EOF
+
+# --- exec module
+cat > server/src/modules/exec/exec.controller.ts <<'EOF'
+import { Router } from 'express';
+import { runCode } from './exec.service';
+
+export const execRouter = Router();
+
+execRouter.post('/run', async (req, res) => {
+  const { language, code } = req.body;
+  try {
+    const out = await runCode(language || 'javascript', code);
+    res.json(out);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+EOF
+
+cat > server/src/modules/exec/exec.service.ts <<'EOF'
+import { spawn } from 'child_process';
+import path from 'path';
+import fs from 'fs';
+import os from 'os';
+import logger from '../../utils/logger';
+
+export async function runCode(language: string, code: string) {
+  // write temp file
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-agent-'));
+  const filename = language === 'python' ? 'code.py' : 'code.js';
+  const filePath = path.join(tmpDir, filename);
+  fs.writeFileSync(filePath, code, 'utf8');
+
+  // call sandbox runner script
+  const runner = path.resolve(process.cwd(), 'sandbox', 'runner.sh');
+  return new Promise((resolve) => {
+    const proc = spawn('bash', [runner, filePath, language], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (d) => (stdout += d.toString()));
+    proc.stderr.on('data', (d) => (stderr += d.toString()));
+    proc.on('close', (codeExit) => {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+      resolve({ exitCode: codeExit, stdout, stderr });
+    });
+  });
+}
+EOF
+
+# --- storage repos
+cat > server/src/modules/storage/snippets.repo.ts <<'EOF'
+import Database from 'better-sqlite3';
+
+export class SnippetsRepo {
+  db: Database;
+  constructor(db: Database) { this.db = db; }
+
+  create(language: string, filename: string | null, content: string) {
+    const stmt = this.db.prepare(`INSERT INTO snippets (language, filename, content) VALUES (?, ?, ?)`);
+    return stmt.run(language, filename, content);
+  }
+
+  findById(id: number) {
+    return this.db.prepare(`SELECT * FROM snippets WHERE id = ?`).get(id);
+  }
+}
+EOF
+
+cat > server/src/modules/storage/embeddings.repo.ts <<'EOF'
+import Database from 'better-sqlite3';
+
+export class EmbeddingsRepo {
+  db: Database;
+  constructor(db: Database) { this.db = db; }
+
+  insert(snippetId: number, vector: Buffer) {
+    const stmt = this.db.prepare(`INSERT INTO embeddings (snippet_id, vector) VALUES (?, ?)`);
+    return stmt.run(snippetId, vector);
+  }
+}
+EOF
+
+# --- workers
+cat > server/src/workers/queue.ts <<'EOF'
+import { Queue } from 'bullmq';
+import config from '../config';
+import IORedis from 'ioredis';
+
+const connection = new IORedis(config.REDIS_URL);
+export const embeddingQueue = new Queue('embeddings', { connection });
+EOF
+
+cat > server/src/workers/embedding.worker.ts <<'EOF'
+import { Worker } from 'bullmq';
+import IORedis from 'ioredis';
+import config from '../config';
+import logger from '../utils/logger';
+import Database from 'better-sqlite3';
+
+const connection = new IORedis(config.REDIS_URL);
+
+export function startEmbeddingWorker(db: Database) {
+  const worker = new Worker('embeddings', async job => {
+    const { snippetId, content } = job.data;
+    try {
+      // create embedding via sqlite-ai UDF
+      db.prepare(\`INSERT INTO embeddings (snippet_id, vector) VALUES (?, ai_embedding(?, 'small-model'))\`).run(snippetId, content);
+      logger.info(\`Created embedding for snippet \${snippetId}\`);
+    } catch (err) {
+      logger.error('Embedding worker error: ' + String(err));
+    }
+  }, { connection });
+
+  worker.on('failed', (job, err) => {
+    logger.error(\`Job \${job.id} failed: \${err}\`);
+  });
+}
+EOF
+
+# --- utils
+cat > server/src/utils/logger.ts <<'EOF'
+import pino from 'pino';
+const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
+export default logger;
+EOF
+
+# --- frontend
+cat > frontend/index.html <<'EOF'
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>AI Agent PoC</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <h1>AI Agent PoC</h1>
+  <textarea id="query" placeholder="Ask about code or request a fix"></textarea>
+  <select id="lang"><option>javascript</option><option>python</option></select>
+  <button id="send">Send</button>
+  <pre id="out"></pre>
+  <script src="app.js"></script>
+</body>
+</html>
+EOF
+
+cat > frontend/app.js <<'EOF'
+document.getElementById('send').onclick = async () => {
+  const q = document.getElementById('query').value;
+  const lang = document.getElementById('lang').value;
+  const res = await fetch('/api/agent/query', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ query: q, language: lang })
+  });
+  const j = await res.json();
+  document.getElementById('out').textContent = JSON.stringify(j, null, 2);
+};
+EOF
+
+cat > frontend/styles.css <<'EOF'
+body { font-family: Arial, sans-serif; padding: 20px; }
+textarea { width: 100%; height: 120px; }
+pre { background:#f4f4f4; padding:10px; }
+EOF
+
+# --- sandbox runner
+cat > sandbox/runner.sh <<'EOF'
+#!/bin/bash
+set -e
+CODE_FILE="$1"
+LANG="$2"
+
+IMAGE="node:18"
+if [ "$LANG" = "python" ]; then
+  IMAGE="python:3.11-slim"
+fi
+
+TMPDIR=$(mktemp -d)
+cp "$CODE_FILE" "$TMPDIR/code"
+
+docker run --rm --network none --cpus="0.5" --memory="256m" -v "$TMPDIR":/workspace -w /workspace "$IMAGE" bash -lc \
+  "timeout 10s bash -c 'if [ -f code ]; then if [ \"$LANG\" = \"python\" ]; then python code; else node code; fi; fi'"
+
+rm -rf "$TMPDIR"
+EOF
+chmod +x sandbox/runner.sh
+
+# --- Dockerfile root
+cat > Dockerfile <<'EOF'
+FROM node:18
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --production
+COPY . .
+WORKDIR /app/server
+RUN npm ci
+RUN npm run build
+COPY sqlite_extensions/libsqliteai.so /usr/local/lib/libsqliteai.so
+ENV LD_PRELOAD=/usr/local/lib/libsqliteai.so
+EXPOSE 3000
+CMD ["node", "dist/main.js"]
+EOF
+
+# --- docker-compose
+cat > docker-compose.yml <<'EOF'
+version: '3.8'
+services:
+  redis:
+    image: redis:7
+    ports: ['6379:6379']
+  server:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+      - ./sqlite_extensions:/app/sqlite_extensions
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DB_PATH=/app/data/data.db
+      - SQLITE_AI_EXT=/app/sqlite_extensions/libsqliteai.so
+    depends_on:
+      - redis
+EOF
+
+# --- .env
+cat > .env <<'EOF'
+PORT=3000
+DB_PATH=./data/data.db
+SQLITE_AI_EXT=./sqlite_extensions/libsqliteai.so
+REDIS_URL=redis://localhost:6379
+EOF
+
+# --- placeholders
+touch data/.gitkeep
+cat > sqlite_extensions/README.txt <<'EOF'
+Place your libsqliteai.so (SQLite-AI extension) here.
+This PoC expects a native extension named libsqliteai.so compatible with your OS/arch.
+EOF
+
+cat > sandbox/Dockerfile.sandbox <<'EOF'
+FROM node:18
+WORKDIR /workspace
+EOF
+
+cat > server/src/types/index.d.ts <<'EOF'
+/* Type placeholders */
+EOF
+
+echo "Skeleton created at: $ROOT_DIR"
+
+# --- Optional automatic steps
+if [ "$AUTO_FLAG" = "--auto" ]; then
+  echo
+  echo "AUTO mode enabled: installing dependencies, building server, and starting docker-compose."
+  echo "Checking required tools: node, npm, docker, docker-compose"
+
+  # check node/npm
+  if ! command -v node >/dev/null 2>&1; then
+    echo "ERROR: node not found. Please install Node.js 18+ and re-run."
+    exit 1
+  fi
+  if ! command -v npm >/dev/null 2>&1; then
+    echo "ERROR: npm not found. Please install npm and re-run."
+    exit 1
+  fi
+
+  # check docker
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "ERROR: docker not found. Please install Docker and re-run."
+    exit 1
+  fi
+
+  # check docker-compose (v2 uses docker compose)
+  if command -v docker-compose >/dev/null 2>&1; then
+    DC_CMD="docker-compose"
+  elif docker compose version >/dev/null 2>&1; then
+    DC_CMD="docker compose"
+  else
+    echo "ERROR: docker-compose not found. Install docker-compose or use Docker v2 (docker compose)."
+    exit 1
+  fi
+
+  # install server deps
+  echo "Installing server dependencies..."
+  (cd server && npm install)
+
+  # build server
+  echo "Building server..."
+  (cd server && npm run build)
+
+  # check libsqliteai presence
+  if [ ! -f "./sqlite_extensions/libsqliteai.so" ]; then
+    echo "WARNING: libsqliteai.so not found in ./sqlite_extensions/"
+    echo "You must place a compatible libsqliteai.so before expecting sqlite-ai functions to work."
+    echo "Continuing: server and docker-compose will still run, but sqlite-ai UDFs will be unavailable."
+  fi
+
+  # run docker-compose
+  echo "Starting services with docker-compose (detached)..."
+  # shellcheck disable=SC2086
+  $DC_CMD up --build -d
+
+  echo "docker-compose started. Use '$DC_CMD ps' to check containers and 'docker logs <container>' to view logs."
+  echo "PoC should be reachable at http://localhost:3000 if containers started successfully."
+fi
+
+echo
+echo "Done. If you did not use --auto, run these commands manually:"
+echo "  cd $ROOT_DIR/server && npm install"
+echo "  cd $ROOT_DIR/server && npm run build"
+echo "  cd $ROOT_DIR && docker-compose up --build"
+Langkah singkat setelah menyimpan skrip
+chmod +x create_poc.sh
+
+Jalankan tanpa auto untuk hanya membuat skeleton: ./create_poc.sh ~/ai-agent-sqlite
+
+Jalankan dengan auto untuk membuat + install + build + run: ./create_poc.sh ~/ai-agent-sqlite --auto
+
+Letakkan libsqliteai.so di ~/ai-agent-sqlite/sqlite_extensions/ sebelum atau segera setelah skrip selesai; jika belum ada, server tetap berjalan tetapi fungsi sqlite‑ai akan fallback.
+
+Jika Anda ingin, saya bisa tambahkan opsi lain (mis. non‑detached compose, log follow, atau pembersihan) dan contoh curl otomatis untuk verifikasi setelah container hidup. Pilih salah satu dan saya akan tambahkan.
+
+
+Smart
+
+Jawaban singkat
+Iya — skrip create_poc.sh --auto sudah otomatis membuat project workspace dalam arti: struktur folder proyek lengkap, semua file PoC (server, sandbox, frontend), dan menjalankan dependensi serta container (via docker-compose up --build -d) bila Anda pakai opsi --auto.  
+
+Namun ada dua hal penting yang belum otomatis dibuat oleh skrip:
+- Binary SQLite‑AI (libsqliteai.so) tidak diunduh atau dibangun otomatis — Anda harus menaruhnya di sqlite_extensions/ sendiri.  
+- VS Code workspace / devcontainer (jika maksud Anda workspace sebagai environment pengembangan terintegrasi seperti .code-workspace atau .devcontainer) belum dibuat otomatis.  
+
+Di bawah ini saya jelaskan detail apa yang sudah dibuat, apa yang belum, dan saya sertakan potongan file yang bisa ditambahkan ke skrip agar VS Code workspace & devcontainer dibuat otomatis juga.
+
+---
+
+Apa yang skrip sudah buat otomatis (dengan --auto)
+- Membuat root project folder dan subfolder (server/, frontend/, sandbox/, sqlite_extensions/, data/, dsb.).  
+- Menulis semua file PoC (TypeScript server, controller, service, migrations, frontend minimal, runner.sh, Dockerfile, docker‑compose.yml).  
+- Menjalankan npm install di server/ dan npm run build (jika Anda jalankan dengan --auto).  
+- Menjalankan docker-compose up --build -d untuk memulai Redis + server container (jika --auto).  
+- Membuat placeholder sqlite_extensions/README.txt dan data/.gitkeep.
+
+---
+
+Apa yang skrip tidak lakukan otomatis
+- Membangun atau mengunduh libsqliteai.so — extension native ini harus Anda sediakan sendiri (atau tambahkan langkah build manual).  
+- Membuat VS Code workspace / devcontainer — skrip saat ini tidak membuat file .code-workspace atau .devcontainer otomatis kecuali Anda minta.  
+- Menyiapkan credential Docker/privilege escalation — skrip mengasumsikan Docker sudah terpasang dan user punya akses.  
+- Mengatur editor (Monaco/CodeMirror) workspace runtime — frontend hanya contoh statis; editor terintegrasi belum disertakan.
+
+---
+
+Jika maksud Anda: “workspace” = VS Code workspace + devcontainer
+Saya tambahkan dua file contoh yang bisa otomatis dibuat oleh skrip: .devcontainer/devcontainer.json dan project.code-workspace. Tempelkan potongan ini ke skrip atau jalankan setelah skrip selesai.
+
+project.code-workspace
+`json
+{
+  "folders": [
+    { "path": "." }
+  ],
+  "settings": {
+    "terminal.integrated.shell.linux": "/bin/bash"
+  }
+}
+`
+
+.devcontainer/devcontainer.json
+`json
+{
+  "name": "AI Agent PoC Devcontainer",
+  "image": "mcr.microsoft.com/vscode/devcontainers/typescript-node:0-18",
+  "workspaceFolder": "/workspace",
+  "mounts": [
+    "source=${localWorkspaceFolder}/data,target=/workspace/data,type=bind",
+    "source=${localWorkspaceFolder}/sqliteextensions,target=/workspace/sqliteextensions,type=bind"
+  ],
+  "postCreateCommand": "cd server && npm install",
+  "remoteUser": "vscode"
+}
+`
+
+Tambahan Dockerfile devcontainer (opsional)
+`dockerfile
+FROM mcr.microsoft.com/vscode/devcontainers/typescript-node:0-18
+
+copy sqlite extension if you want it baked in (optional)
+`
+
+Jika Anda ingin, saya bisa modifikasi skrip create_poc.sh untuk menulis file‑file di atas otomatis (sudah siap saya siapkan). Setelah itu, membuka folder di VS Code dan memilih “Reopen in Container” akan menyiapkan environment dev yang terisolasi.
+
+---
+
+Jika maksud Anda: “workspace” = area kerja runtime untuk user (editor web)
+- Skrip sudah membuat frontend/ dengan UI minimal.  
+- Jika Anda ingin editor web (Monaco) yang menyimpan workspace per user, saya bisa tambahkan:
+  - integrasi Monaco Editor di frontend/,  
+  - endpoint backend untuk menyimpan workspace per user ke SQLite (workspaces table),  
+  - dan UI untuk load/save workspace.  
+Saya bisa tambahkan ini otomatis ke skrip bila Anda mau.
+
+---
+
+Ringkasan tindakan yang saya sarankan sekarang (pilih salah satu)
+- Saya tambahkan pembuatan VS Code workspace & devcontainer ke skrip (otomatis).  
+- Saya tambahkan integrasi Monaco + penyimpanan workspace ke PoC (otomatis).  
+- Saya tambahkan langkah build otomatis libsqliteai.so jika Anda beri repo sumber atau instruksi build untuk extension itu.  
+
+Saya sudah siap menambahkan salah satu atau semua opsi di atas ke skrip otomatis sekarang. Saya akan langsung menambahkan VS Code devcontainer dan .code-workspace ke skrip kecuali Anda memilih opsi lain.
+
+Ringkasan singkat
+Saya tambahkan semua yang Anda minta: VS Code workspace, devcontainer, integrasi Monaco editor di frontend, dan VS Code extension yang dikemas menjadi .vsix. Di bawah ini ada skrip otomatis yang memperbarui project skeleton, menambahkan file‑file devcontainer dan Monaco, membuat scaffold extension VS Code, dan skrip untuk membangun paket VSIX. Ikuti langkah yang saya sertakan untuk menghasilkan file .vsix yang bisa Anda pasang di VS Code.
+
+---
+
+Perubahan utama yang ditambahkan
+- VS Code workspace file project.code-workspace.  
+- Devcontainer di .devcontainer/ dengan devcontainer.json dan optional Dockerfile.  
+- Frontend: integrasi Monaco Editor (editor kode di browser) di frontend/ dan endpoint backend untuk menyimpan/ambil workspace.  
+- VS Code Extension scaffold di vscode-extension/:
+  - package.json extension manifest
+  - src/extension.ts (command untuk membuka webview yang memuat frontend PoC)
+  - webview/ assets (HTML/CSS/JS) yang memuat frontend atau embed Monaco
+  - skrip build dan packaging (build_vsix.sh) menggunakan vsce/@vscode/vsce
+- Skrip otomatis create_poc.sh diperbarui untuk menulis file‑file di atas dan menambahkan langkah pembuatan VSIX bila opsi --auto dipilih dan vsce tersedia.
+
+---
+
+File dan path yang ditambahkan
+`
+ai-agent-sqlite/
+├─ project.code-workspace
+├─ .devcontainer/
+│  ├─ devcontainer.json
+│  └─ Dockerfile
+├─ frontend/
+│  ├─ monaco/
+│  │  ├─ index.html
+│  │  ├─ monaco-app.js
+│  │  └─ monaco.css
+├─ vscode-extension/
+│  ├─ package.json
+│  ├─ tsconfig.json
+│  ├─ src/
+│  │  └─ extension.ts
+│  ├─ webview/
+│  │  ├─ index.html
+│  │  └─ webview.js
+│  └─ build_vsix.sh
+`
+
+---
+
+Potongan penting yang saya tambahkan
+Salin‑tempel potongan berikut ke file sesuai path. Jika Anda sudah menjalankan skrip otomatis sebelumnya, file ini akan dibuat oleh skrip; jika tidak, buat manual.
+
+project.code-workspace
+`json
+{
+  "folders": [
+    { "path": "." }
+  ],
+  "settings": {
+    "terminal.integrated.shell.linux": "/bin/bash",
+    "files.exclude": {
+      "node_modules": true,
+      ".git": true
+    }
+  }
+}
+`
+
+.devcontainer/devcontainer.json
+`json
+{
+  "name": "AI Agent PoC Devcontainer",
+  "image": "mcr.microsoft.com/vscode/devcontainers/typescript-node:0-18",
+  "workspaceFolder": "/workspace",
+  "mounts": [
+    "source=${localWorkspaceFolder}/data,target=/workspace/data,type=bind",
+    "source=${localWorkspaceFolder}/sqliteextensions,target=/workspace/sqliteextensions,type=bind"
+  ],
+  "postCreateCommand": "cd server && npm install",
+  "remoteUser": "vscode"
+}
+`
+
+frontend/monaco/index.html
+`html
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Monaco Editor PoC</title>
+  <link rel="stylesheet" href="monaco.css" />
+</head>
+<body>
+  <div id="editor" style="height:70vh;border:1px solid #ddd"></div>
+  <div>
+    <button id="save">Save Workspace</button>
+    <button id="run">Run</button>
+  </div>
+  <pre id="out"></pre>
+  <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.39.0/min/vs/loader.js"></script>
+  <script src="monaco-app.js"></script>
+</body>
+</html>
+`
+
+frontend/monaco/monaco-app.js
+`js
+require.config({ paths: { 'vs': 'https://cdn.jsdelivr.net/npm/monaco-editor@0.39.0/min/vs' }});
+require(['vs/editor/editor.main'], function() {
+  const editor = monaco.editor.create(document.getElementById('editor'), {
+    value: '// Tulis kode di sini\nfunction hello(){ console.log("hello"); }',
+    language: 'javascript',
+    theme: 'vs-light',
+    automaticLayout: true
+  });
+
+  document.getElementById('save').onclick = async () => {
+    const content = editor.getValue();
+    await fetch('/api/ingest/snippet', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ language: 'javascript', filename: 'monaco-snippet.js', content })
+    });
+    alert('Saved to local SQLite');
+  };
+
+  document.getElementById('run').onclick = async () => {
+    const code = editor.getValue();
+    const res = await fetch('/api/exec/run', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ language: 'javascript', code })
+    });
+    const j = await res.json();
+    document.getElementById('out').textContent = JSON.stringify(j, null, 2);
+  };
+});
+`
+
+vscode-extension/package.json
+`json
+{
+  "name": "ai-agent-poc",
+  "displayName": "AI Agent PoC",
+  "publisher": "your-publisher",
+  "version": "0.0.1",
+  "engines": { "vscode": "^1.70.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onCommand:aiAgent.openWebview"],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "aiAgent.openWebview",
+        "title": "AI Agent PoC: Open"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "tsc -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/vscode": "^1.70.0",
+    "vsce": "^2.10.0"
+  },
+  "dependencies": {}
+}
+`
+
+vscode-extension/tsconfig.json
+`json
+{
+  "compilerOptions": {
+    "module": "CommonJS",
+    "target": "ES2020",
+    "outDir": "dist",
+    "rootDir": "src",
+    "lib": ["ES2020"],
+    "sourceMap": true,
+    "strict": true
+  },
+  "include": ["src"]
+}
+`
+
+vscode-extension/src/extension.ts
+`ts
+import * as vscode from 'vscode';
+import * as path from 'path';
+import * as fs from 'fs';
+
+export function activate(context: vscode.ExtensionContext) {
+  const cmd = vscode.commands.registerCommand('aiAgent.openWebview', () => {
+    const panel = vscode.window.createWebviewPanel(
+      'aiAgentWebview',
+      'AI Agent PoC',
+      vscode.ViewColumn.One,
+      {
+        enableScripts: true,
+        localResourceRoots: [vscode.Uri.file(path.join(context.extensionPath, 'webview'))]
+      }
+    );
+
+    const htmlPath = path.join(context.extensionPath, 'webview', 'index.html');
+    let html = fs.readFileSync(htmlPath, 'utf8');
+
+    // rewrite local resource URIs
+    html = html.replace(/(src|href)="([^"]+)"/g, (m, p1, p2) => {
+      if (p2.startsWith('http')) return ${p1}="${p2}";
+      const uri = panel.webview.asWebviewUri(vscode.Uri.file(path.join(context.extensionPath, 'webview', p2)));
+      return ${p1}="${uri}";
+    });
+
+    panel.webview.html = html;
+  });
+
+  context.subscriptions.push(cmd);
+}
+
+export function deactivate() {}
+`
+
+vscode-extension/webview/index.html
+`html
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>AI Agent Webview</title>
+  <style>body{font-family:Arial;padding:10px}#editor{height:60vh;border:1px solid #ddd}</style>
+</head>
+<body>
+  <h2>AI Agent PoC Webview</h2>
+  <iframe id="app" src="../frontend/monaco/index.html" style="width:100%;height:70vh;border:0"></iframe>
+</body>
+</html>
+`
+
+> Catatan: webview memuat frontend/monaco/index.html via iframe dari extension webview folder. Pastikan path relatif benar saat packaging.
+
+vscode-extension/build_vsix.sh
+`bash
+
+!/usr/bin/env bash
+set -e
+cd "$(dirname "$0")"
+npm install
+npm run build
+
+package with vsce
+if ! command -v vsce >/dev/null 2>&1; then
+  echo "vsce not found, installing locally..."
+  npm install -g vsce
+fi
+vsce package
+echo "VSIX package created in $(pwd)"
+`
+Beri izin eksekusi chmod +x build_vsix.sh.
+
+---
+
+Memperbarui skrip create_poc.sh untuk otomatisasi VSIX
+Tambahkan langkah berikut di akhir skrip create_poc.sh ketika --auto dipakai:
+- jalankan npm install di vscode-extension/
+- jalankan ./vscode-extension/build_vsix.sh
+- hasil .vsix akan berada di vscode-extension/ (mis. ai-agent-poc-0.0.1.vsix)
+
+Contoh snippet yang ditambahkan ke skrip:
+`bash
+
+after building server
+echo "Building VS Code extension and packaging VSIX..."
+(cd vscode-extension && ./build_vsix.sh)
+`
+
+---
+
+Cara membangun VSIX secara manual
+1. Masuk ke folder extension:
+`bash
+cd ai-agent-sqlite/vscode-extension
+`
+2. Install dependensi dan build:
+`bash
+npm install
+npm run build
+`
+3. Pasang vsce bila belum:
+`bash
+npm install -g vsce
+`
+4. Buat paket VSIX:
+`bash
+vsce package
+`
+5. File .vsix akan muncul di folder vscode-extension/.
+
+---
+
+Cara memasang VSIX di VS Code
+- Buka VS Code → Extensions → klik menu titik tiga → Install from VSIX… → pilih file .vsix.  
+- Setelah terpasang, jalankan command palette AI Agent PoC: Open untuk membuka webview yang memuat frontend Monaco.
+
+---
+
+Pengujian cepat setelah VSIX terpasang
+1. Pastikan server PoC berjalan (docker-compose up atau npm run dev).  
+2. Buka VS Code, jalankan command AI Agent PoC: Open.  
+3. Webview akan menampilkan frontend Monaco; coba simpan snippet dan jalankan kode lewat tombol di webview. Hasil eksekusi muncul di panel output webview.
+
+---
+
+Catatan keamanan dan batasan
+- Webview extension hanya memuat frontend lokal dari paket extension; extension tidak menjalankan server sendiri. Pastikan server PoC berjalan agar fitur ingest/run bekerja.  
+- Packaging VSIX menyertakan file webview dan frontend; jika Anda mengubah path atau menaruh frontend/ di luar extension folder, sesuaikan webview/index.html dan extension.ts.  
+- libsqliteai.so tetap harus Anda sediakan di sqlite_extensions/ pada host yang menjalankan server. Extension VSIX tidak mengemas binary native untuk server.
+
+---
+
+Langkah berikutnya yang saya siapkan untuk Anda
+Saya sudah menyiapkan semua potongan kode dan skrip yang diperlukan. Jika Anda ingin, saya bisa:
+- kirimkan skrip final create_poc.sh yang sudah diperbarui untuk membuat devcontainer, Monaco, extension, dan otomatis membangun VSIX ketika --auto dipakai; atau  
+- berikan perintah curl otomatis untuk verifikasi setelah container dan extension berjalan; atau  
+- bantu menulis instruksi build untuk libsqliteai.so jika Anda beri link repo sumbernya.
+
+Pilih salah satu opsi di atas dan saya akan lanjutkan langsung.
+
+Create PoC script (final, full automation)
+
+Berikut skrip create_poc.sh final yang membuat seluruh workspace PoC, menulis file‑file server/frontend/devcontainer/VSCode extension, menginstal dependensi, membangun server, menjalankan docker-compose, dan membangun paket VSIX untuk extension bila opsi --auto dipilih. Simpan skrip ini di mesin Anda, beri izin eksekusi, lalu jalankan.
+
+`bash
+
+!/usr/bin/env bash
+set -euo pipefail
+
+Usage:
+
+./createpoc.sh [TARGETDIR] [--auto]
+
+Examples:
+
+./create_poc.sh ./ai-agent-sqlite
+
+./create_poc.sh ~/ai-agent-sqlite --auto
+
+
+
+--auto : setelah membuat skeleton, script akan:
+
+- npm install di server/ dan vscode-extension/
+
+- npm run build di server/ dan vscode-extension/
+
+- docker-compose up --build -d
+
+- membangun VSIX (menggunakan vsce) jika tersedia
+
+
+
+IMPORTANT: script tidak mengunduh atau membangun libsqliteai.so.
+
+Letakkan libsqliteai.so di <TARGETDIR>/sqliteextensions/ sebelum menjalankan docker-compose
+
+atau segera setelah skrip selesai. Jika tidak ada, sqlite-ai UDF akan fallback.
+
+ROOT_DIR="${1:-./ai-agent-sqlite}"
+AUTO_FLAG="${2:-}"
+
+echo "Target project dir: $ROOT_DIR"
+echo "Auto mode: ${AUTO_FLAG}"
+
+mkdir -p "$ROOT_DIR"
+cd "$ROOT_DIR"
+
+-------------------------
+
+Root package.json
+
+-------------------------
+cat > package.json <<'EOF'
+{
+  "name": "ai-agent-sqlite",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "start": "node dist/main.js",
+    "dev": "ts-node-dev --respawn --transpile-only server/src/main.ts",
+    "build": "tsc -p server/tsconfig.json"
+  }
+}
+EOF
+
+-------------------------
+
+Create directories
+
+-------------------------
+mkdir -p server/src/{config,db,modules/{auth,ingest,agent,exec,storage},workers,utils,types}
+mkdir -p sqlite_extensions data sandbox frontend vscode-extension .devcontainer
+
+-------------------------
+
+server/package.json
+
+-------------------------
+cat > server/package.json <<'EOF'
+{
+  "name": "ai-agent-sqlite-server",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/main.js",
+  "scripts": {
+    "start": "node dist/main.js",
+    "dev": "ts-node-dev --respawn --transpile-only src/main.ts",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "better-sqlite3": "^8.0.0",
+    "express": "^4.18.2",
+    "body-parser": "^1.20.2",
+    "bullmq": "^2.8.0",
+    "ioredis": "^5.3.2",
+    "pino": "^8.0.0",
+    "dotenv": "^16.0.0"
+  },
+  "devDependencies": {
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.0.0",
+    "@types/express": "^4.17.17"
+  }
+}
+EOF
+
+-------------------------
+
+server/tsconfig.json
+
+-------------------------
+cat > server/tsconfig.json <<'EOF'
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "CommonJS",
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  },
+  "include": ["src"]
+}
+EOF
+
+-------------------------
+
+server/src/main.ts
+
+-------------------------
+cat > server/src/main.ts <<'EOF'
+import express from 'express';
+import bodyParser from 'body-parser';
+import dotenv from 'dotenv';
+import { initDb } from './db/sqlite';
+import { agentRouter } from './modules/agent/agent.controller';
+import { ingestRouter } from './modules/ingest/ingest.controller';
+import { execRouter } from './modules/exec/exec.controller';
+import logger from './utils/logger';
+import { startEmbeddingWorker } from './workers/embedding.worker';
+
+dotenv.config();
+
+const app = express();
+app.use(bodyParser.json());
+
+const db = initDb();
+app.locals.db = db;
+
+// start worker (in-process for PoC)
+startEmbeddingWorker(db);
+
+app.use('/api/agent', agentRouter);
+app.use('/api/ingest', ingestRouter);
+app.use('/api/exec', execRouter);
+
+// serve frontend static (monaco and simple UI)
+app.use('/', express.static('frontend'));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  logger.info(Server listening on ${PORT});
+});
+EOF
+
+-------------------------
+
+server/src/config/index.ts
+
+-------------------------
+cat > server/src/config/index.ts <<'EOF'
+import dotenv from 'dotenv';
+dotenv.config();
+
+export default {
+  PORT: process.env.PORT || '3000',
+  DBPATH: process.env.DBPATH || './data/data.db',
+  SQLITEAIEXT: process.env.SQLITEAIEXT || './sqlite_extensions/libsqliteai.so',
+  SANDBOXIMAGE: process.env.SANDBOXIMAGE || 'node:18',
+  REDISURL: process.env.REDISURL || 'redis://localhost:6379'
+};
+EOF
+
+-------------------------
+
+server/src/db/migrations.sql
+
+-------------------------
+cat > server/src/db/migrations.sql <<'EOF'
+CREATE TABLE IF NOT EXISTS snippets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  language TEXT NOT NULL,
+  filename TEXT,
+  content TEXT NOT NULL,
+  createdat DATETIME DEFAULT CURRENTTIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS embeddings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  snippet_id INTEGER NOT NULL,
+  vector BLOB NOT NULL,
+  createdat DATETIME DEFAULT CURRENTTIMESTAMP,
+  FOREIGN KEY(snippet_id) REFERENCES snippets(id)
+);
+
+CREATE TABLE IF NOT EXISTS history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  query TEXT,
+  response TEXT,
+  createdat DATETIME DEFAULT CURRENTTIMESTAMP
+);
+EOF
+
+-------------------------
+
+server/src/db/sqlite.ts
+
+-------------------------
+cat > server/src/db/sqlite.ts <<'EOF'
+import Database from 'better-sqlite3';
+import fs from 'fs';
+import path from 'path';
+import config from '../config';
+import logger from '../utils/logger';
+
+export function initDb() {
+  const dbPath = path.resolve(process.cwd(), config.DB_PATH);
+  const extPath = path.resolve(process.cwd(), config.SQLITEAIEXT);
+
+  if (!fs.existsSync(path.dirname(dbPath))) {
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  }
+
+  const db = new Database(dbPath);
+  try {
+    if (fs.existsSync(extPath)) {
+      db.loadExtension(extPath);
+      logger.info('Loaded sqlite-ai extension from ' + extPath);
+    } else {
+      logger.warn('sqlite-ai extension not found at ' + extPath);
+    }
+  } catch (err) {
+    logger.error('Failed to load sqlite extension: ' + String(err));
+  }
+
+  const migrations = fs.readFileSync(path.resolve(dirname, 'migrations.sql'), 'utf8');
+  db.exec(migrations);
+  return db;
+}
+EOF
+
+-------------------------
+
+modules: agent
+
+-------------------------
+cat > server/src/modules/agent/agent.controller.ts <<'EOF'
+import { Router } from 'express';
+import { handleQuery } from './agent.service';
+
+export const agentRouter = Router();
+
+agentRouter.post('/query', async (req, res) => {
+  const { query, language } = req.body;
+  try {
+    const out = await handleQuery(req.app.locals.db, query, language || 'javascript');
+    res.json(out);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+EOF
+
+cat > server/src/modules/agent/agent.service.ts <<'EOF'
+import Database from 'better-sqlite3';
+import logger from '../../utils/logger';
+
+export async function handleQuery(db: Database, query: string, language: string) {
+  if (!query) throw new Error('query required');
+
+  // 1. retrieval top 5 via sqlite-ai functions if available
+  let rows;
+  try {
+    const stmt = db.prepare(\`
+      SELECT s.id, s.filename, s.content
+      FROM snippets s
+      JOIN embeddings e ON e.snippet_id = s.id
+      ORDER BY aicosinesimilarity(e.vector, ai_embedding(?, 'small-model')) DESC
+      LIMIT 5
+    \`);
+    rows = stmt.all(query);
+  } catch (err) {
+    // fallback: simple keyword match
+    logger.warn('sqlite-ai retrieval failed, using fallback: ' + String(err));
+    const stmt = db.prepare(\SELECT id, filename, content FROM snippets WHERE content LIKE ? LIMIT 5\);
+    rows = stmt.all(\%\${query.split(' ').slice(0,3).join('%')}%\);
+  }
+
+  const context = rows.map(r => \// \${r.filename || 'snippet'}\n\${r.content}\).join('\n\n---\n\n');
+
+  const prompt = \You are an on-device coding assistant for \${language}.\nContext:\n\${context}\nUser: \${query}\nAssistant:\;
+
+  // 2. generate via sqlite-ai UDF ai_generate if available
+  let output = '';
+  try {
+    const genStmt = db.prepare(\SELECT aigenerate(?, 'small-model', json('{ "maxtokens": 512 }')) as output\);
+    const out = genStmt.get(prompt);
+    output = out?.output || '';
+  } catch (err) {
+    logger.warn('sqlite-ai generate failed, returning simple response: ' + String(err));
+    output = 'sqlite-ai not available; fallback: provide guidance based on context.';
+  }
+
+  // 3. save history
+  try {
+    db.prepare(\INSERT INTO history (query, response) VALUES (?, ?)\).run(query, output);
+  } catch (err) {
+    logger.warn('Failed to save history: ' + String(err));
+  }
+
+  return { answer: output, contextCount: rows.length };
+}
+EOF
+
+-------------------------
+
+modules: ingest
+
+-------------------------
+cat > server/src/modules/ingest/ingest.controller.ts <<'EOF'
+import { Router } from 'express';
+import { ingestSnippet } from './ingest.service';
+
+export const ingestRouter = Router();
+
+ingestRouter.post('/snippet', async (req, res) => {
+  const { language, filename, content } = req.body;
+  try {
+    const out = await ingestSnippet(req.app.locals.db, { language, filename, content });
+    res.json(out);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+EOF
+
+cat > server/src/modules/ingest/ingest.service.ts <<'EOF'
+import Database from 'better-sqlite3';
+import logger from '../../utils/logger';
+
+export async function ingestSnippet(db: Database, payload: { language: string; filename?: string; content: string }) {
+  const { language, filename, content } = payload;
+  const insert = db.prepare(\INSERT INTO snippets (language, filename, content) VALUES (?, ?, ?)\);
+  const info = insert.run(language || 'text', filename || null, content);
+  const snippetId = info.lastInsertRowid as number;
+
+  // create embedding via sqlite-ai if available
+  try {
+    const embStmt = db.prepare(\INSERT INTO embeddings (snippetid, vector) VALUES (?, aiembedding(?, 'small-model'))\);
+    embStmt.run(snippetId, content);
+  } catch (err) {
+    logger.warn('Failed to create embedding: ' + String(err));
+  }
+
+  return { id: snippetId };
+}
+EOF
+
+-------------------------
+
+modules: exec
+
+-------------------------
+cat > server/src/modules/exec/exec.controller.ts <<'EOF'
+import { Router } from 'express';
+import { runCode } from './exec.service';
+
+export const execRouter = Router();
+
+execRouter.post('/run', async (req, res) => {
+  const { language, code } = req.body;
+  try {
+    const out = await runCode(language || 'javascript', code);
+    res.json(out);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+EOF
+
+cat > server/src/modules/exec/exec.service.ts <<'EOF'
+import { spawn } from 'child_process';
+import path from 'path';
+import fs from 'fs';
+import os from 'os';
+import logger from '../../utils/logger';
+
+export async function runCode(language: string, code: string) {
+  // write temp file
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-agent-'));
+  const filename = language === 'python' ? 'code.py' : 'code.js';
+  const filePath = path.join(tmpDir, filename);
+  fs.writeFileSync(filePath, code, 'utf8');
+
+  // call sandbox runner script
+  const runner = path.resolve(process.cwd(), 'sandbox', 'runner.sh');
+  return new Promise((resolve) => {
+    const proc = spawn('bash', [runner, filePath, language], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (d) => (stdout += d.toString()));
+    proc.stderr.on('data', (d) => (stderr += d.toString()));
+    proc.on('close', (codeExit) => {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+      resolve({ exitCode: codeExit, stdout, stderr });
+    });
+  });
+}
+EOF
+
+-------------------------
+
+storage repos
+
+-------------------------
+cat > server/src/modules/storage/snippets.repo.ts <<'EOF'
+import Database from 'better-sqlite3';
+
+export class SnippetsRepo {
+  db: Database;
+  constructor(db: Database) { this.db = db; }
+
+  create(language: string, filename: string | null, content: string) {
+    const stmt = this.db.prepare(INSERT INTO snippets (language, filename, content) VALUES (?, ?, ?));
+    return stmt.run(language, filename, content);
+  }
+
+  findById(id: number) {
+    return this.db.prepare(SELECT * FROM snippets WHERE id = ?).get(id);
+  }
+}
+EOF
+
+cat > server/src/modules/storage/embeddings.repo.ts <<'EOF'
+import Database from 'better-sqlite3';
+
+export class EmbeddingsRepo {
+  db: Database;
+  constructor(db: Database) { this.db = db; }
+
+  insert(snippetId: number, vector: Buffer) {
+    const stmt = this.db.prepare(INSERT INTO embeddings (snippet_id, vector) VALUES (?, ?));
+    return stmt.run(snippetId, vector);
+  }
+}
+EOF
+
+-------------------------
+
+workers
+
+-------------------------
+cat > server/src/workers/queue.ts <<'EOF'
+import { Queue } from 'bullmq';
+import config from '../config';
+import IORedis from 'ioredis';
+
+const connection = new IORedis(config.REDIS_URL);
+export const embeddingQueue = new Queue('embeddings', { connection });
+EOF
+
+cat > server/src/workers/embedding.worker.ts <<'EOF'
+import { Worker } from 'bullmq';
+import IORedis from 'ioredis';
+import config from '../config';
+import logger from '../utils/logger';
+import Database from 'better-sqlite3';
+
+const connection = new IORedis(config.REDIS_URL);
+
+export function startEmbeddingWorker(db: Database) {
+  const worker = new Worker('embeddings', async job => {
+    const { snippetId, content } = job.data;
+    try {
+      // create embedding via sqlite-ai UDF
+      db.prepare(\INSERT INTO embeddings (snippetid, vector) VALUES (?, aiembedding(?, 'small-model'))\).run(snippetId, content);
+      logger.info(\Created embedding for snippet \${snippetId}\);
+    } catch (err) {
+      logger.error('Embedding worker error: ' + String(err));
+    }
+  }, { connection });
+
+  worker.on('failed', (job, err) => {
+    logger.error(\Job \${job.id} failed: \${err}\);
+  });
+}
+EOF
+
+-------------------------
+
+utils
+
+-------------------------
+cat > server/src/utils/logger.ts <<'EOF'
+import pino from 'pino';
+const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
+export default logger;
+EOF
+
+-------------------------
+
+frontend minimal + monaco
+
+-------------------------
+cat > frontend/index.html <<'EOF'
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>AI Agent PoC</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <h1>AI Agent PoC</h1>
+  <a href="/monaco/index.html" target="_self">Open Monaco Editor</a>
+  <pre id="out"></pre>
+</body>
+</html>
+EOF
+
+cat > frontend/styles.css <<'EOF'
+body { font-family: Arial, sans-serif; padding: 20px; }
+pre { background:#f4f4f4; padding:10px; }
+EOF
+
+mkdir -p frontend/monaco
+cat > frontend/monaco/index.html <<'EOF'
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Monaco Editor PoC</title>
+  <link rel="stylesheet" href="monaco.css" />
+</head>
+<body>
+  <div id="editor" style="height:70vh;border:1px solid #ddd"></div>
+  <div style="margin-top:8px">
+    <button id="save">Save Workspace</button>
+    <button id="run">Run</button>
+  </div>
+  <pre id="out"></pre>
+  <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.39.0/min/vs/loader.js"></script>
+  <script src="monaco-app.js"></script>
+</body>
+</html>
+EOF
+
+cat > frontend/monaco/monaco.css <<'EOF'
+body { font-family: Arial, sans-serif; padding: 10px; }
+
+editor { border: 1px solid #ddd; }
+EOF
+
+cat > frontend/monaco/monaco-app.js <<'EOF'
+require.config({ paths: { 'vs': 'https://cdn.jsdelivr.net/npm/monaco-editor@0.39.0/min/vs' }});
+require(['vs/editor/editor.main'], function() {
+  const editor = monaco.editor.create(document.getElementById('editor'), {
+    value: '// Tulis kode di sini\\nfunction hello(){ console.log("hello"); }',
+    language: 'javascript',
+    theme: 'vs-light',
+    automaticLayout: true
+  });
+
+  document.getElementById('save').onclick = async () => {
+    const content = editor.getValue();
+    await fetch('/api/ingest/snippet', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ language: 'javascript', filename: 'monaco-snippet.js', content })
+    });
+    alert('Saved to local SQLite');
+  };
+
+  document.getElementById('run').onclick = async () => {
+    const code = editor.getValue();
+    const res = await fetch('/api/exec/run', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ language: 'javascript', code })
+    });
+    const j = await res.json();
+    document.getElementById('out').textContent = JSON.stringify(j, null, 2);
+  };
+});
+EOF
+
+-------------------------
+
+sandbox runner
+
+-------------------------
+cat > sandbox/runner.sh <<'EOF'
+
+!/bin/bash
+set -e
+CODE_FILE="$1"
+LANG="$2"
+
+IMAGE="node:18"
+if [ "$LANG" = "python" ]; then
+  IMAGE="python:3.11-slim"
+fi
+
+TMPDIR=$(mktemp -d)
+cp "$CODE_FILE" "$TMPDIR/code"
+
+docker run --rm --network none --cpus="0.5" --memory="256m" -v "$TMPDIR":/workspace -w /workspace "$IMAGE" bash -lc \
+  "timeout 10s bash -c 'if [ -f code ]; then if [ \"$LANG\" = \"python\" ]; then python code; else node code; fi; fi'"
+
+rm -rf "$TMPDIR"
+EOF
+chmod +x sandbox/runner.sh
+
+-------------------------
+
+Dockerfile root
+
+-------------------------
+cat > Dockerfile <<'EOF'
+FROM node:18
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --production
+COPY . .
+WORKDIR /app/server
+RUN npm ci
+RUN npm run build
+COPY sqlite_extensions/libsqliteai.so /usr/local/lib/libsqliteai.so
+ENV LD_PRELOAD=/usr/local/lib/libsqliteai.so
+EXPOSE 3000
+CMD ["node", "dist/main.js"]
+EOF
+
+-------------------------
+
+docker-compose.yml
+
+-------------------------
+cat > docker-compose.yml <<'EOF'
+version: '3.8'
+services:
+  redis:
+    image: redis:7
+    ports: ['6379:6379']
+  server:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+      - ./sqliteextensions:/app/sqliteextensions
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DB_PATH=/app/data/data.db
+      - SQLITEAIEXT=/app/sqlite_extensions/libsqliteai.so
+    depends_on:
+      - redis
+EOF
+
+-------------------------
+
+.env
+
+-------------------------
+cat > .env <<'EOF'
+PORT=3000
+DB_PATH=./data/data.db
+SQLITEAIEXT=./sqlite_extensions/libsqliteai.so
+REDIS_URL=redis://localhost:6379
+EOF
+
+touch data/.gitkeep
+cat > sqlite_extensions/README.txt <<'EOF'
+Place your libsqliteai.so (SQLite-AI extension) here.
+This PoC expects a native extension named libsqliteai.so compatible with your OS/arch.
+EOF
+
+-------------------------
+
+VS Code workspace & devcontainer
+
+-------------------------
+cat > project.code-workspace <<'EOF'
+{
+  "folders": [
+    { "path": "." }
+  ],
+  "settings": {
+    "terminal.integrated.shell.linux": "/bin/bash",
+    "files.exclude": {
+      "node_modules": true,
+      ".git": true
+    }
+  }
+}
+EOF
+
+cat > .devcontainer/devcontainer.json <<'EOF'
+{
+  "name": "AI Agent PoC Devcontainer",
+  "image": "mcr.microsoft.com/vscode/devcontainers/typescript-node:0-18",
+  "workspaceFolder": "/workspace",
+  "mounts": [
+    "source=${localWorkspaceFolder}/data,target=/workspace/data,type=bind",
+    "source=${localWorkspaceFolder}/sqliteextensions,target=/workspace/sqliteextensions,type=bind"
+  ],
+  "postCreateCommand": "cd server && npm install",
+  "remoteUser": "vscode"
+}
+EOF
+
+cat > .devcontainer/Dockerfile <<'EOF'
+FROM mcr.microsoft.com/vscode/devcontainers/typescript-node:0-18
+
+Optional: add tools if needed
+EOF
+
+-------------------------
+
+VS Code extension scaffold
+
+-------------------------
+mkdir -p vscode-extension/src vscode-extension/webview
+
+cat > vscode-extension/package.json <<'EOF'
+{
+  "name": "ai-agent-poc",
+  "displayName": "AI Agent PoC",
+  "publisher": "your-publisher",
+  "version": "0.0.1",
+  "engines": { "vscode": "^1.70.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onCommand:aiAgent.openWebview"],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "aiAgent.openWebview",
+        "title": "AI Agent PoC: Open"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "tsc -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/vscode": "^1.70.0",
+    "vsce": "^2.10.0"
+  },
+  "dependencies": {}
+}
+EOF
+
+cat > vscode-extension/tsconfig.json <<'EOF'
+{
+  "compilerOptions": {
+    "module": "CommonJS",
+    "target": "ES2020",
+    "outDir": "dist",
+    "rootDir": "src",
+    "lib": ["ES2020"],
+    "sourceMap": true,
+    "strict": true
+  },
+  "include": ["src"]
+}
+EOF
+
+cat > vscode-extension/src/extension.ts <<'EOF'
+import * as vscode from 'vscode';
+import * as path from 'path';
+import * as fs from 'fs';
+
+export function activate(context: vscode.ExtensionContext) {
+  const cmd = vscode.commands.registerCommand('aiAgent.openWebview', () => {
+    const panel = vscode.window.createWebviewPanel(
+      'aiAgentWebview',
+      'AI Agent PoC',
+      vscode.ViewColumn.One,
+      {
+        enableScripts: true,
+        localResourceRoots: [vscode.Uri.file(path.join(context.extensionPath, 'webview'))]
+      }
+    );
+
+    const htmlPath = path.join(context.extensionPath, 'webview', 'index.html');
+    let html = fs.readFileSync(htmlPath, 'utf8');
+
+    html = html.replace(/(src|href)="([^"]+)"/g, (m, p1, p2) => {
+      if (p2.startsWith('http')) return ${p1}="${p2}";
+      const uri = panel.webview.asWebviewUri(vscode.Uri.file(path.join(context.extensionPath, 'webview', p2)));
+      return ${p1}="${uri}";
+    });
+
+    panel.webview.html = html;
+  });
+
+  context.subscriptions.push(cmd);
+}
+
+export function deactivate() {}
+EOF
+
+cat > vscode-extension/webview/index.html <<'EOF'
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>AI Agent Webview</title>
+  <style>body{font-family:Arial;padding:10px}#editor{height:60vh;border:1px solid #ddd}</style>
+</head>
+<body>
+  <h2>AI Agent PoC Webview</h2>
+  <iframe id="app" src="../frontend/monaco/index.html" style="width:100%;height:70vh;border:0"></iframe>
+</body>
+</html>
+EOF
+
+cat > vscode-extension/build_vsix.sh <<'EOF'
+
+!/usr/bin/env bash
+set -e
+cd "$(dirname "$0")"
+npm install
+npm run build
+if ! command -v vsce >/dev/null 2>&1; then
+  echo "vsce not found, installing globally..."
+  npm install -g vsce
+fi
+vsce package
+echo "VSIX package created in $(pwd)"
+EOF
+chmod +x vscode-extension/build_vsix.sh
+
+-------------------------
+
+placeholders and types
+
+-------------------------
+cat > server/src/types/index.d.ts <<'EOF'
+/ Type placeholders /
+EOF
+
+-------------------------
+
+Final Docker and compose already created above
+
+-------------------------
+
+echo "Skeleton created at: $ROOT_DIR"
+
+-------------------------
+
+Optional automatic steps
+
+-------------------------
+if [ "$AUTO_FLAG" = "--auto" ]; then
+  echo
+  echo "AUTO mode enabled: installing dependencies, building server, building extension, and starting docker-compose."
+  echo "Checking required tools: node, npm, docker, docker-compose"
+
+check node/npm
+  if ! command -v node >/dev/null 2>&1; then
+    echo "ERROR: node not found. Please install Node.js 18+ and re-run."
+    exit 1
+  fi
+  if ! command -v npm >/dev/null 2>&1; then
+    echo "ERROR: npm not found. Please install npm and re-run."
+    exit 1
+  fi
+
+check docker
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "ERROR: docker not found. Please install Docker and re-run."
+    exit 1
+  fi
+
+determine docker-compose command
+  if command -v docker-compose >/dev/null 2>&1; then
+    DC_CMD="docker-compose"
+  elif docker compose version >/dev/null 2>&1; then
+    DC_CMD="docker compose"
+  else
+    echo "ERROR: docker-compose not found. Install docker-compose or use Docker v2 (docker compose)."
+    exit 1
+  fi
+
+install server deps
+  echo "Installing server dependencies..."
+  (cd server && npm install)
+
+build server
+  echo "Building server..."
+  (cd server && npm run build)
+
+install extension deps and build
+  echo "Installing and building VS Code extension..."
+  (cd vscode-extension && npm install && npm run build)
+
+build VSIX if vsce available or install it
+  if ! command -v vsce >/dev/null 2>&1; then
+    echo "vsce not found, installing globally..."
+    npm install -g vsce
+  fi
+
+  echo "Packaging VSIX..."
+  (cd vscode-extension && vsce package || true)
+  echo "If packaging failed, check vscode-extension logs."
+
+check libsqliteai presence
+  if [ ! -f "./sqlite_extensions/libsqliteai.so" ]; then
+    echo "WARNING: libsqliteai.so not found in ./sqlite_extensions/"
+    echo "You must place a compatible libsqliteai.so before expecting sqlite-ai functions to work."
+    echo "Continuing: server and docker-compose will be started, but sqlite-ai UDFs will be unavailable."
+  fi
+
+run docker-compose
+  echo "Starting services with docker-compose (detached)..."
+
+shellcheck disable=SC2086
+  $DC_CMD up --build -d
+
+  echo "docker-compose started. Use '$DC_CMD ps' to check containers and 'docker logs <container>' to view logs."
+  echo "PoC should be reachable at http://localhost:3000 if containers started successfully."
+fi
+
+echo
+echo "Done."
+echo
+echo "Next manual steps if not using --auto:"
+echo "  cd $ROOT_DIR/server && npm install"
+echo "  cd $ROOT_DIR/server && npm run build"
+echo "  cd $ROOT_DIR && docker-compose up --build"
+echo
+echo "Place libsqliteai.so into: $ROOTDIR/sqliteextensions/libsqliteai.so"
+echo "Build VSIX manually (if not auto):"
+echo "  cd $ROOT_DIR/vscode-extension"
+echo "  npm install"
+echo "  npm run build"
+echo "  npm install -g vsce"
+echo "  vsce package"
+`
+
+Cara pakai singkat
+- Simpan sebagai createpoc.sh, beri izin: chmod +x createpoc.sh.  
+- Jalankan pembuatan skeleton saja: ./create_poc.sh ~/ai-agent-sqlite  
+- Jalankan otomatis penuh (install, build, run, package VSIX): ./create_poc.sh ~/ai-agent-sqlite --auto  
+- Letakkan libsqliteai.so di ~/ai-agent-sqlite/sqlite_extensions/ sebelum atau segera setelah menjalankan --auto agar fungsi sqlite‑ai aktif.
+
+Saya sudah menyiapkan skrip final ini untuk Anda; jika Anda ingin, saya bisa juga kirimkan perintah curl otomatis untuk verifikasi endpoint setelah container hidup, atau bantu menulis instruksi build untuk libsqliteai.so jika Anda beri tautan repo sumbernya.
+
+Skrip lengkap create_poc.sh
+
+Simpan sebagai createpoc.sh, beri izin eksekusi (chmod +x createpoc.sh), lalu jalankan. Skrip ini membuat seluruh proyek PoC (server, frontend, sandbox, devcontainer, VS Code extension), menginstal dependensi, membangun server, menjalankan docker-compose, dan mem-package VSIX bila opsi --auto dipakai. Catatan penting: skrip tidak mengunduh atau membangun libsqliteai.so; letakkan binary libsqliteai.so di sqlite_extensions/ agar fungsi sqlite‑ai aktif.
+
+`bash
+
+!/usr/bin/env bash
+set -euo pipefail
+
+Usage:
+
+./createpoc.sh [TARGETDIR] [--auto]
+
+Examples:
+
+./create_poc.sh ./ai-agent-sqlite
+
+./create_poc.sh ~/ai-agent-sqlite --auto
+
+
+
+--auto : setelah membuat skeleton, script akan:
+
+- npm install di server/ dan vscode-extension/
+
+- npm run build di server/ dan vscode-extension/
+
+- docker-compose up --build -d
+
+- membangun VSIX (menggunakan vsce) jika tersedia
+
+
+
+IMPORTANT: script tidak mengunduh atau membangun libsqliteai.so.
+
+Letakkan libsqliteai.so di <TARGETDIR>/sqliteextensions/ sebelum menjalankan docker-compose
+
+atau segera setelah skrip selesai. Jika tidak ada, sqlite-ai UDF akan fallback.
+
+ROOT_DIR="${1:-./ai-agent-sqlite}"
+AUTO_FLAG="${2:-}"
+
+echo "Target project dir: $ROOT_DIR"
+echo "Auto mode: ${AUTO_FLAG}"
+
+mkdir -p "$ROOT_DIR"
+cd "$ROOT_DIR"
+
+-------------------------
+
+Root package.json
+
+-------------------------
+cat > package.json <<'EOF'
+{
+  "name": "ai-agent-sqlite",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "start": "node dist/main.js",
+    "dev": "ts-node-dev --respawn --transpile-only server/src/main.ts",
+    "build": "tsc -p server/tsconfig.json"
+  }
+}
+EOF
+
+-------------------------
+
+Create directories
+
+-------------------------
+mkdir -p server/src/{config,db,modules/{auth,ingest,agent,exec,storage},workers,utils,types}
+mkdir -p sqlite_extensions data sandbox frontend vscode-extension .devcontainer
+
+-------------------------
+
+server/package.json
+
+-------------------------
+cat > server/package.json <<'EOF'
+{
+  "name": "ai-agent-sqlite-server",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/main.js",
+  "scripts": {
+    "start": "node dist/main.js",
+    "dev": "ts-node-dev --respawn --transpile-only src/main.ts",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "better-sqlite3": "^8.0.0",
+    "express": "^4.18.2",
+    "body-parser": "^1.20.2",
+    "bullmq": "^2.8.0",
+    "ioredis": "^5.3.2",
+    "pino": "^8.0.0",
+    "dotenv": "^16.0.0"
+  },
+  "devDependencies": {
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.0.0",
+    "@types/express": "^4.17.17"
+  }
+}
+EOF
+
+-------------------------
+
+server/tsconfig.json
+
+-------------------------
+cat > server/tsconfig.json <<'EOF'
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "CommonJS",
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  },
+  "include": ["src"]
+}
+EOF
+
+-------------------------
+
+server/src/main.ts
+
+-------------------------
+cat > server/src/main.ts <<'EOF'
+import express from 'express';
+import bodyParser from 'body-parser';
+import dotenv from 'dotenv';
+import { initDb } from './db/sqlite';
+import { agentRouter } from './modules/agent/agent.controller';
+import { ingestRouter } from './modules/ingest/ingest.controller';
+import { execRouter } from './modules/exec/exec.controller';
+import logger from './utils/logger';
+import { startEmbeddingWorker } from './workers/embedding.worker';
+
+dotenv.config();
+
+const app = express();
+app.use(bodyParser.json());
+
+const db = initDb();
+app.locals.db = db;
+
+// start worker (in-process for PoC)
+startEmbeddingWorker(db);
+
+app.use('/api/agent', agentRouter);
+app.use('/api/ingest', ingestRouter);
+app.use('/api/exec', execRouter);
+
+// serve frontend static (monaco and simple UI)
+app.use('/', express.static('frontend'));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  logger.info(Server listening on ${PORT});
+});
+EOF
+
+-------------------------
+
+server/src/config/index.ts
+
+-------------------------
+cat > server/src/config/index.ts <<'EOF'
+import dotenv from 'dotenv';
+dotenv.config();
+
+export default {
+  PORT: process.env.PORT || '3000',
+  DBPATH: process.env.DBPATH || './data/data.db',
+  SQLITEAIEXT: process.env.SQLITEAIEXT || './sqlite_extensions/libsqliteai.so',
+  SANDBOXIMAGE: process.env.SANDBOXIMAGE || 'node:18',
+  REDISURL: process.env.REDISURL || 'redis://localhost:6379'
+};
+EOF
+
+-------------------------
+
+server/src/db/migrations.sql
+
+-------------------------
+cat > server/src/db/migrations.sql <<'EOF'
+CREATE TABLE IF NOT EXISTS snippets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  language TEXT NOT NULL,
+  filename TEXT,
+  content TEXT NOT NULL,
+  createdat DATETIME DEFAULT CURRENTTIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS embeddings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  snippet_id INTEGER NOT NULL,
+  vector BLOB NOT NULL,
+  createdat DATETIME DEFAULT CURRENTTIMESTAMP,
+  FOREIGN KEY(snippet_id) REFERENCES snippets(id)
+);
+
+CREATE TABLE IF NOT EXISTS history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  query TEXT,
+  response TEXT,
+  createdat DATETIME DEFAULT CURRENTTIMESTAMP
+);
+EOF
+
+-------------------------
+
+server/src/db/sqlite.ts
+
+-------------------------
+cat > server/src/db/sqlite.ts <<'EOF'
+import Database from 'better-sqlite3';
+import fs from 'fs';
+import path from 'path';
+import config from '../config';
+import logger from '../utils/logger';
+
+export function initDb() {
+  const dbPath = path.resolve(process.cwd(), config.DB_PATH);
+  const extPath = path.resolve(process.cwd(), config.SQLITEAIEXT);
+
+  if (!fs.existsSync(path.dirname(dbPath))) {
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  }
+
+  const db = new Database(dbPath);
+  try {
+    if (fs.existsSync(extPath)) {
+      db.loadExtension(extPath);
+      logger.info('Loaded sqlite-ai extension from ' + extPath);
+    } else {
+      logger.warn('sqlite-ai extension not found at ' + extPath);
+    }
+  } catch (err) {
+    logger.error('Failed to load sqlite extension: ' + String(err));
+  }
+
+  const migrations = fs.readFileSync(path.resolve(dirname, 'migrations.sql'), 'utf8');
+  db.exec(migrations);
+  return db;
+}
+EOF
+
+-------------------------
+
+modules: agent
+
+-------------------------
+cat > server/src/modules/agent/agent.controller.ts <<'EOF'
+import { Router } from 'express';
+import { handleQuery } from './agent.service';
+
+export const agentRouter = Router();
+
+agentRouter.post('/query', async (req, res) => {
+  const { query, language } = req.body;
+  try {
+    const out = await handleQuery(req.app.locals.db, query, language || 'javascript');
+    res.json(out);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+EOF
+
+cat > server/src/modules/agent/agent.service.ts <<'EOF'
+import Database from 'better-sqlite3';
+import logger from '../../utils/logger';
+
+export async function handleQuery(db: Database, query: string, language: string) {
+  if (!query) throw new Error('query required');
+
+  // 1. retrieval top 5 via sqlite-ai functions if available
+  let rows;
+  try {
+    const stmt = db.prepare(\`
+      SELECT s.id, s.filename, s.content
+      FROM snippets s
+      JOIN embeddings e ON e.snippet_id = s.id
+      ORDER BY aicosinesimilarity(e.vector, ai_embedding(?, 'small-model')) DESC
+      LIMIT 5
+    \`);
+    rows = stmt.all(query);
+  } catch (err) {
+    // fallback: simple keyword match
+    logger.warn('sqlite-ai retrieval failed, using fallback: ' + String(err));
+    const stmt = db.prepare(\SELECT id, filename, content FROM snippets WHERE content LIKE ? LIMIT 5\);
+    rows = stmt.all(\%\${query.split(' ').slice(0,3).join('%')}%\);
+  }
+
+  const context = rows.map(r => \// \${r.filename || 'snippet'}\n\${r.content}\).join('\n\n---\n\n');
+
+  const prompt = \You are an on-device coding assistant for \${language}.\nContext:\n\${context}\nUser: \${query}\nAssistant:\;
+
+  // 2. generate via sqlite-ai UDF ai_generate if available
+  let output = '';
+  try {
+    const genStmt = db.prepare(\SELECT aigenerate(?, 'small-model', json('{ "maxtokens": 512 }')) as output\);
+    const out = genStmt.get(prompt);
+    output = out?.output || '';
+  } catch (err) {
+    logger.warn('sqlite-ai generate failed, returning simple response: ' + String(err));
+    output = 'sqlite-ai not available; fallback: provide guidance based on context.';
+  }
+
+  // 3. save history
+  try {
+    db.prepare(\INSERT INTO history (query, response) VALUES (?, ?)\).run(query, output);
+  } catch (err) {
+    logger.warn('Failed to save history: ' + String(err));
+  }
+
+  return { answer: output, contextCount: rows.length };
+}
+EOF
+
+-------------------------
+
+modules: ingest
+
+-------------------------
+cat > server/src/modules/ingest/ingest.controller.ts <<'EOF'
+import { Router } from 'express';
+import { ingestSnippet } from './ingest.service';
+
+export const ingestRouter = Router();
+
+ingestRouter.post('/snippet', async (req, res) => {
+  const { language, filename, content } = req.body;
+  try {
+    const out = await ingestSnippet(req.app.locals.db, { language, filename, content });
+    res.json(out);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+EOF
+
+cat > server/src/modules/ingest/ingest.service.ts <<'EOF'
+import Database from 'better-sqlite3';
+import logger from '../../utils/logger';
+
+export async function ingestSnippet(db: Database, payload: { language: string; filename?: string; content: string }) {
+  const { language, filename, content } = payload;
+  const insert = db.prepare(\INSERT INTO snippets (language, filename, content) VALUES (?, ?, ?)\);
+  const info = insert.run(language || 'text', filename || null, content);
+  const snippetId = info.lastInsertRowid as number;
+
+create embedding via sqlite-ai if available
+  try {
+    const embStmt = db.prepare(\INSERT INTO embeddings (snippetid, vector) VALUES (?, aiembedding(?, 'small-model'))\);
+    embStmt.run(snippetId, content);
+  } catch (err) {
+    logger.warn('Failed to create embedding: ' + String(err));
+  }
+
+  return { id: snippetId };
+}
+EOF
+
+-------------------------
+
+modules: exec
+
+-------------------------
+cat > server/src/modules/exec/exec.controller.ts <<'EOF'
+import { Router } from 'express';
+import { runCode } from './exec.service';
+
+export const execRouter = Router();
+
+execRouter.post('/run', async (req, res) => {
+  const { language, code } = req.body;
+  try {
+    const out = await runCode(language || 'javascript', code);
+    res.json(out);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+EOF
+
+cat > server/src/modules/exec/exec.service.ts <<'EOF'
+import { spawn } from 'child_process';
+import path from 'path';
+import fs from 'fs';
+import os from 'os';
+import logger from '../../utils/logger';
+
+export async function runCode(language: string, code: string) {
+  // write temp file
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-agent-'));
+  const filename = language === 'python' ? 'code.py' : 'code.js';
+  const filePath = path.join(tmpDir, filename);
+  fs.writeFileSync(filePath, code, 'utf8');
+
+  // call sandbox runner script
+  const runner = path.resolve(process.cwd(), 'sandbox', 'runner.sh');
+  return new Promise((resolve) => {
+    const proc = spawn('bash', [runner, filePath, language], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (d) => (stdout += d.toString()));
+    proc.stderr.on('data', (d) => (stderr += d.toString()));
+    proc.on('close', (codeExit) => {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+      resolve({ exitCode: codeExit, stdout, stderr });
+    });
+  });
+}
+EOF
+
+-------------------------
+
+storage repos
+
+-------------------------
+cat > server/src/modules/storage/snippets.repo.ts <<'EOF'
+import Database from 'better-sqlite3';
+
+export class SnippetsRepo {
+  db: Database;
+  constructor(db: Database) { this.db = db; }
+
+  create(language: string, filename: string | null, content: string) {
+    const stmt = this.db.prepare(INSERT INTO snippets (language, filename, content) VALUES (?, ?, ?));
+    return stmt.run(language, filename, content);
+  }
+
+  findById(id: number) {
+    return this.db.prepare(SELECT * FROM snippets WHERE id = ?).get(id);
+  }
+}
+EOF
+
+cat > server/src/modules/storage/embeddings.repo.ts <<'EOF'
+import Database from 'better-sqlite3';
+
+export class EmbeddingsRepo {
+  db: Database;
+  constructor(db: Database) { this.db = db; }
+
+  insert(snippetId: number, vector: Buffer) {
+    const stmt = this.db.prepare(INSERT INTO embeddings (snippet_id, vector) VALUES (?, ?));
+    return stmt.run(snippetId, vector);
+  }
+}
+EOF
+
+-------------------------
+
+workers
+
+-------------------------
+cat > server/src/workers/queue.ts <<'EOF'
+import { Queue } from 'bullmq';
+import config from '../config';
+import IORedis from 'ioredis';
+
+const connection = new IORedis(config.REDIS_URL);
+export const embeddingQueue = new Queue('embeddings', { connection });
+EOF
+
+cat > server/src/workers/embedding.worker.ts <<'EOF'
+import { Worker } from 'bullmq';
+import IORedis from 'ioredis';
+import config from '../config';
+import logger from '../utils/logger';
+import Database from 'better-sqlite3';
+
+const connection = new IORedis(config.REDIS_URL);
+
+export function startEmbeddingWorker(db: Database) {
+  const worker = new Worker('embeddings', async job => {
+    const { snippetId, content } = job.data;
+    try {
+      // create embedding via sqlite-ai UDF
+      db.prepare(\INSERT INTO embeddings (snippetid, vector) VALUES (?, aiembedding(?, 'small-model'))\).run(snippetId, content);
+      logger.info(\Created embedding for snippet \${snippetId}\);
+    } catch (err) {
+      logger.error('Embedding worker error: ' + String(err));
+    }
+  }, { connection });
+
+  worker.on('failed', (job, err) => {
+    logger.error(\Job \${job.id} failed: \${err}\);
+  });
+}
+EOF
+
+-------------------------
+
+utils
+
+-------------------------
+cat > server/src/utils/logger.ts <<'EOF'
+import pino from 'pino';
+const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
+export default logger;
+EOF
+
+-------------------------
+
+frontend minimal + monaco
+
+-------------------------
+cat > frontend/index.html <<'EOF'
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>AI Agent PoC</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <h1>AI Agent PoC</h1>
+  <a href="/monaco/index.html" target="_self">Open Monaco Editor</a>
+  <pre id="out"></pre>
+</body>
+</html>
+EOF
+
+cat > frontend/styles.css <<'EOF'
+body { font-family: Arial, sans-serif; padding: 20px; }
+pre { background:#f4f4f4; padding:10px; }
+EOF
+
+mkdir -p frontend/monaco
+cat > frontend/monaco/index.html <<'EOF'
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Monaco Editor PoC</title>
+  <link rel="stylesheet" href="monaco.css" />
+</head>
+<body>
+  <div id="editor" style="height:70vh;border:1px solid #ddd"></div>
+  <div style="margin-top:8px">
+    <button id="save">Save Workspace</button>
+    <button id="run">Run</button>
+  </div>
+  <pre id="out"></pre>
+  <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.39.0/min/vs/loader.js"></script>
+  <script src="monaco-app.js"></script>
+</body>
+</html>
+EOF
+
+cat > frontend/monaco/monaco.css <<'EOF'
+body { font-family: Arial, sans-serif; padding: 10px; }
+
+editor { border: 1px solid #ddd; }
+EOF
+
+cat > frontend/monaco/monaco-app.js <<'EOF'
+require.config({ paths: { 'vs': 'https://cdn.jsdelivr.net/npm/monaco-editor@0.39.0/min/vs' }});
+require(['vs/editor/editor.main'], function() {
+  const editor = monaco.editor.create(document.getElementById('editor'), {
+    value: '// Tulis kode di sini\\nfunction hello(){ console.log("hello"); }',
+    language: 'javascript',
+    theme: 'vs-light',
+    automaticLayout: true
+  });
+
+  document.getElementById('save').onclick = async () => {
+    const content = editor.getValue();
+    await fetch('/api/ingest/snippet', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ language: 'javascript', filename: 'monaco-snippet.js', content })
+    });
+    alert('Saved to local SQLite');
+  };
+
+  document.getElementById('run').onclick = async () => {
+    const code = editor.getValue();
+    const res = await fetch('/api/exec/run', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ language: 'javascript', code })
+    });
+    const j = await res.json();
+    document.getElementById('out').textContent = JSON.stringify(j, null, 2);
+  };
+});
+EOF
+
+-------------------------
+
+sandbox runner
+
+-------------------------
+cat > sandbox/runner.sh <<'EOF'
+
+!/bin/bash
+set -e
+CODE_FILE="$1"
+LANG="$2"
+
+IMAGE="node:18"
+if [ "$LANG" = "python" ]; then
+  IMAGE="python:3.11-slim"
+fi
+
+TMPDIR=$(mktemp -d)
+cp "$CODE_FILE" "$TMPDIR/code"
+
+docker run --rm --network none --cpus="0.5" --memory="256m" -v "$TMPDIR":/workspace -w /workspace "$IMAGE" bash -lc \
+  "timeout 10s bash -c 'if [ -f code ]; then if [ \"$LANG\" = \"python\" ]; then python code; else node code; fi; fi'"
+
+rm -rf "$TMPDIR"
+EOF
+chmod +x sandbox/runner.sh
+
+-------------------------
+
+Dockerfile root
+
+-------------------------
+cat > Dockerfile <<'EOF'
+FROM node:18
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --production
+COPY . .
+WORKDIR /app/server
+RUN npm ci
+RUN npm run build
+COPY sqlite_extensions/libsqliteai.so /usr/local/lib/libsqliteai.so
+ENV LD_PRELOAD=/usr/local/lib/libsqliteai.so
+EXPOSE 3000
+CMD ["node", "dist/main.js"]
+EOF
+
+-------------------------
+
+docker-compose.yml
+
+-------------------------
+cat > docker-compose.yml <<'EOF'
+version: '3.8'
+services:
+  redis:
+    image: redis:7
+    ports: ['6379:6379']
+  server:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+      - ./sqliteextensions:/app/sqliteextensions
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DB_PATH=/app/data/data.db
+      - SQLITEAIEXT=/app/sqlite_extensions/libsqliteai.so
+    depends_on:
+      - redis
+EOF
+
+-------------------------
+
+.env
+
+-------------------------
+cat > .env <<'EOF'
+PORT=3000
+DB_PATH=./data/data.db
+SQLITEAIEXT=./sqlite_extensions/libsqliteai.so
+REDIS_URL=redis://localhost:6379
+EOF
+
+touch data/.gitkeep
+cat > sqlite_extensions/README.txt <<'EOF'
+Place your libsqliteai.so (SQLite-AI extension) here.
+This PoC expects a native extension named libsqliteai.so compatible with your OS/arch.
+EOF
+
+-------------------------
+
+VS Code workspace & devcontainer
+
+-------------------------
+cat > project.code-workspace <<'EOF'
+{
+  "folders": [
+    { "path": "." }
+  ],
+  "settings": {
+    "terminal.integrated.shell.linux": "/bin/bash",
+    "files.exclude": {
+      "node_modules": true,
+      ".git": true
+    }
+  }
+}
+EOF
+
+cat > .devcontainer/devcontainer.json <<'EOF'
+{
+  "name": "AI Agent PoC Devcontainer",
+  "image": "mcr.microsoft.com/vscode/devcontainers/typescript-node:0-18",
+  "workspaceFolder": "/workspace",
+  "mounts": [
+    "source=${localWorkspaceFolder}/data,target=/workspace/data,type=bind",
+    "source=${localWorkspaceFolder}/sqliteextensions,target=/workspace/sqliteextensions,type=bind"
+  ],
+  "postCreateCommand": "cd server && npm install",
+  "remoteUser": "vscode"
+}
+EOF
+
+cat > .devcontainer/Dockerfile <<'EOF'
+FROM mcr.microsoft.com/vscode/devcontainers/typescript-node:0-18
+
+Optional: add tools if needed
+EOF
+
+-------------------------
+
+VS Code extension scaffold
+
+-------------------------
+mkdir -p vscode-extension/src vscode-extension/webview
+
+cat > vscode-extension/package.json <<'EOF'
+{
+  "name": "ai-agent-poc",
+  "displayName": "AI Agent PoC",
+  "publisher": "your-publisher",
+  "version": "0.0.1",
+  "engines": { "vscode": "^1.70.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onCommand:aiAgent.openWebview"],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "aiAgent.openWebview",
+        "title": "AI Agent PoC: Open"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "tsc -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/vscode": "^1.70.0",
+    "vsce": "^2.10.0"
+  },
+  "dependencies": {}
+}
+EOF
+
+cat > vscode-extension/tsconfig.json <<'EOF'
+{
+  "compilerOptions": {
+    "module": "CommonJS",
+    "target": "ES2020",
+    "outDir": "dist",
+    "rootDir": "src",
+    "lib": ["ES2020"],
+    "sourceMap": true,
+    "strict": true
+  },
+  "include": ["src"]
+}
+EOF
+
+cat > vscode-extension/src/extension.ts <<'EOF'
+import * as vscode from 'vscode';
+import * as path from 'path';
+import * as fs from 'fs';
+
+export function activate(context: vscode.ExtensionContext) {
+  const cmd = vscode.commands.registerCommand('aiAgent.openWebview', () => {
+    const panel = vscode.window.createWebviewPanel(
+      'aiAgentWebview',
+      'AI Agent PoC',
+      vscode.ViewColumn.One,
+      {
+        enableScripts: true,
+        localResourceRoots: [vscode.Uri.file(path.join(context.extensionPath, 'webview'))]
+      }
+    );
+
+    const htmlPath = path.join(context.extensionPath, 'webview', 'index.html');
+    let html = fs.readFileSync(htmlPath, 'utf8');
+
+    html = html.replace(/(src|href)="([^"]+)"/g, (m, p1, p2) => {
+      if (p2.startsWith('http')) return ${p1}="${p2}";
+      const uri = panel.webview.asWebviewUri(vscode.Uri.file(path.join(context.extensionPath, 'webview', p2)));
+      return ${p1}="${uri}";
+    });
+
+    panel.webview.html = html;
+  });
+
+  context.subscriptions.push(cmd);
+}
+
+export function deactivate() {}
+EOF
+
+cat > vscode-extension/webview/index.html <<'EOF'
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>AI Agent Webview</title>
+  <style>body{font-family:Arial;padding:10px}#editor{height:60vh;border:1px solid #ddd}</style>
+</head>
+<body>
+  <h2>AI Agent PoC Webview</h2>
+  <iframe id="app" src="../frontend/monaco/index.html" style="width:100%;height:70vh;border:0"></iframe>
+</body>
+</html>
+EOF
+
+cat > vscode-extension/build_vsix.sh <<'EOF'
+
+!/usr/bin/env bash
+set -e
+cd "$(dirname "$0")"
+npm install
+npm run build
+if ! command -v vsce >/dev/null 2>&1; then
+  echo "vsce not found, installing globally..."
+  npm install -g vsce
+fi
+vsce package
+echo "VSIX package created in $(pwd)"
+EOF
+chmod +x vscode-extension/build_vsix.sh
+
+-------------------------
+
+placeholders and types
+
+-------------------------
+cat > server/src/types/index.d.ts <<'EOF'
+/ Type placeholders /
+EOF
+
+-------------------------
+
+Final Docker and compose already created above
+
+-------------------------
+
+echo "Skeleton created at: $ROOT_DIR"
+
+-------------------------
+
+Optional automatic steps
+
+-------------------------
+if [ "$AUTO_FLAG" = "--auto" ]; then
+  echo
+  echo "AUTO mode enabled: installing dependencies, building server, building extension, and starting docker-compose."
+  echo "Checking required tools: node, npm, docker, docker-compose"
+
+check node/npm
+  if ! command -v node >/dev/null 2>&1; then
+    echo "ERROR: node not found. Please install Node.js 18+ and re-run."
+    exit 1
+  fi
+  if ! command -v npm >/dev/null 2>&1; then
+    echo "ERROR: npm not found. Please install npm and re-run."
+    exit 1
+  fi
+
+check docker
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "ERROR: docker not found. Please install Docker and re-run."
+    exit 1
+  fi
+
+determine docker-compose command
+  if command -v docker-compose >/dev/null 2>&1; then
+    DC_CMD="docker-compose"
+  elif docker compose version >/dev/null 2>&1; then
+    DC_CMD="docker compose"
+  else
+    echo "ERROR: docker-compose not found. Install docker-compose or use Docker v2 (docker compose)."
+    exit 1
+  fi
+
+install server deps
+  echo "Installing server dependencies..."
+  (cd server && npm install)
+
+build server
+  echo "Building server..."
+  (cd server && npm run build)
+
+install extension deps and build
+  echo "Installing and building VS Code extension..."
+  (cd vscode-extension && npm install && npm run build)
+
+build VSIX if vsce available or install it
+  if ! command -v vsce >/dev/null 2>&1; then
+    echo "vsce not found, installing globally..."
+    npm install -g vsce
+  fi
+
+  echo "Packaging VSIX..."
+  (cd vscode-extension && vsce package || true)
+  echo "If packaging failed, check vscode-extension logs."
+
+check libsqliteai presence
+  if [ ! -f "./sqlite_extensions/libsqliteai.so" ]; then
+    echo "WARNING: libsqliteai.so not found in ./sqlite_extensions/"
+    echo "You must place a compatible libsqliteai.so before expecting sqlite-ai functions to work."
+    echo "Continuing: server and docker-compose will be started, but sqlite-ai UDFs will be unavailable."
+  fi
+
+run docker-compose
+  echo "Starting services with docker-compose (detached)..."
+
+shellcheck disable=SC2086
+  $DC_CMD up --build -d
+
+  echo "docker-compose started. Use '$DC_CMD ps' to check containers and 'docker logs <container>' to view logs."
+  echo "PoC should be reachable at http://localhost:3000 if containers started successfully."
+fi
+
+echo
+echo "Done."
+echo
+echo "Next manual steps if not using --auto:"
+echo "  cd $ROOT_DIR/server && npm install"
+echo "  cd $ROOT_DIR/server && npm run build"
+echo "  cd $ROOT_DIR && docker-compose up --build"
+echo
+echo "Place libsqliteai.so into: $ROOTDIR/sqliteextensions/libsqliteai.so"
+echo "Build VSIX manually (if not auto):"
+echo "  cd $ROOT_DIR/vscode-extension"
+echo "  npm install"
+echo "  npm run build"
+echo "  npm install -g vsce"
+echo "  vsce package"
+`
+
+---
+
+Struktur root proyek lengkap
+
+`
+ai-agent-sqlite/
+├─ create_poc.sh
+├─ package.json
+├─ tsconfig.json (optional)
+├─ .env
+├─ docker-compose.yml
+├─ Dockerfile
+├─ sqlite_extensions/
+│  ├─ libsqliteai.so (place binary here)
+│  └─ README.txt
+├─ data/
+│  └─ .gitkeep
+├─ server/
+│  ├─ package.json
+│  ├─ tsconfig.json
+│  └─ src/
+│     ├─ main.ts
+│     ├─ config/
+│     │  └─ index.ts
+│     ├─ db/
+│     │  ├─ sqlite.ts
+│     │  └─ migrations.sql
+│     ├─ modules/
+│     │  ├─ auth/
+│     │  │  ├─ auth.controller.ts
+│     │  │  ├─ auth.service.ts
+│     │  │  └─ auth.types.ts
+│     │  ├─ ingest/
+│     │  │  ├─ ingest.controller.ts
+│     │  │  ├─ ingest.service.ts
+│     │  │  └─ ingest.utils.ts
+│     │  ├─ agent/
+│     │  │  ├─ agent.controller.ts
+│     │  │  ├─ agent.service.ts
+│     │  │  └─ agent.types.ts
+│     │  ├─ exec/
+│     │  │  ├─ exec.controller.ts
+│     │  │  ├─ exec.service.ts
+│     │  │  └─ sandbox.runner.ts
+│     │  └─ storage/
+│     │     ├─ snippets.repo.ts
+│     │     └─ embeddings.repo.ts
+│     ├─ workers/
+│     │  ├─ queue.ts
+│     │  └─ embedding.worker.ts
+│     ├─ utils/
+│     │  ├─ logger.ts
+│     │  └─ validators.ts
+│     └─ types/
+│        └─ index.d.ts
+├─ sandbox/
+│  ├─ Dockerfile.sandbox
+│  └─ runner.sh
+├─ frontend/
+│  ├─ index.html
+│  ├─ styles.css
+│  └─ monaco/
+│     ├─ index.html
+│     ├─ monaco.css
+│     └─ monaco-app.js
+├─ vscode-extension/
+│  ├─ package.json
+│  ├─ tsconfig.json
+│  ├─ src/
+│  │  └─ extension.ts
+│  ├─ webview/
+│  │  └─ index.html
+│  └─ build_vsix.sh
+└─ .devcontainer/
+   ├─ devcontainer.json
+   └─ Dockerfile
+`
+
+---
+
+Perintah cepat untuk menjalankan PoC lokal
+Buat project dan jalankan otomatis
+`bash
+chmod +x create_poc.sh
+./create_poc.sh ~/ai-agent-sqlite --auto
+`
+
+Jika tidak pakai auto, langkah manual
+`bash
+./create_poc.sh ~/ai-agent-sqlite
+cd ~/ai-agent-sqlite/server
+npm install
+npm run build
+cd ~/ai-agent-sqlite
+docker-compose up --build -d
+`
+
+Uji endpoint
+`bash
+curl -X POST http://localhost:3000/api/ingest/snippet \
+  -H "Content-Type: application/json" \
+  -d '{"language":"javascript","filename":"sum.js","content":"function sum(a,b){return a+b;}"}'
+
+curl -X POST http://localhost:3000/api/agent/query \
+  -H "Content-Type: application/json" \
+  -d '{"query":"Explain sum function","language":"javascript"}'
+
+curl -X POST http://localhost:3000/api/exec/run \
+  -H "Content-Type: application/json" \
+  -d '{"language":"javascript","code":"console.log(1+2)"}'
+`
+
+---
+
+Saya sudah menyiapkan skrip dan struktur lengkap. Jika Anda jalankan skrip sekarang dan menempelkan output log atau error yang muncul, saya akan bantu analisis dan perbaikan langkah demi langkah.
